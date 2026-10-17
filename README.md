@@ -44,4 +44,6 @@ A Dockerfile application from this repository, with a persistent volume at `/dat
 | `TRUSTED_PROXIES` | proxies in front that append to `X-Forwarded-For` (1 for Coolify's Traefik; 0 when nothing is in front) |
 
 `TRUSTED_PROXIES` must match the deployment: too high and clients can forge their address past the limits, too low
-and every client shares the proxy's.
+and every client shares the proxy's. **Behind Cloudflare's proxy (orange cloud) and Coolify's Traefik, set it to 2.**
+Then also allow only Cloudflare's addresses to reach the server directly (a firewall rule, or a Cloudflare Tunnel):
+a request that skips Cloudflare could otherwise put an address of its choosing in the second-to-last place.
