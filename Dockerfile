@@ -10,9 +10,12 @@ RUN npm run build && npm prune --omit=dev
 FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production DB_PATH=/data/myriad.db PORT=3000
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json ./
+COPY --from=build --chown=root:root /app/node_modules ./node_modules
+COPY --from=build --chown=root:root /app/dist ./dist
+COPY --chown=root:root package.json ./
+# Runs as the unprivileged `node` user: it can write only the database volume, not its own code.
+RUN mkdir -p /data && chown node:node /data
+USER node
 VOLUME /data
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:3000/health || exit 1

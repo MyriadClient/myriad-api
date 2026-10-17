@@ -13,8 +13,9 @@ service (Hono on Node 24, SQLite through Node's built-in `node:sqlite`), deploye
 | `DELETE /v1/configs/:code` | With `Authorization: Bearer <deleteKey>`: deletes it. Only the publisher has the key (the client keeps it); the server stores its hash. |
 | `GET /health` | `{ok: true}` |
 
-The server checks a share's shape, caps its sizes, and drops anything the format doesn't have. A setting the client
-marked protected is never stored with a value, whatever was sent (the client leaves those values out already).
+The server rebuilds every share from a whitelist (unknown fields dropped, types checked, lengths capped, colours hex
+only) and never stores a value for a setting the client marked protected. See [SECURITY.md](SECURITY.md) for how the
+API protects players, and how to report a problem.
 
 ## Running
 
@@ -35,6 +36,12 @@ A Dockerfile application from this repository, with a persistent volume at `/dat
 | | |
 |---|---|
 | `SITE_URL` | the website, for share links (`https://myriadclient.dev`) |
-| `UPLOADS_PER_HOUR`, `UPLOADS_PER_DAY` | publishing limits per address (10, 50) |
+| `UPLOADS_PER_HOUR`, `UPLOADS_PER_DAY` | publishing limits per client (10, 50) |
+| `GLOBAL_UPLOADS_PER_HOUR` | publishing ceiling for everyone together (2000) |
+| `READS_PER_MINUTE`, `MISSES_PER_MINUTE` | fetches per client, and how many may be codes that don't exist (120, 20) |
+| `DELETES_PER_HOUR` | delete attempts per client (30) |
 | `MAX_SHARE_BYTES` | largest share (262144) |
-| `TRUST_PROXY` | take the address from `X-Forwarded-For` (true; Coolify's proxy sets it) |
+| `TRUSTED_PROXIES` | proxies in front that append to `X-Forwarded-For` (1 for Coolify's Traefik; 0 when nothing is in front) |
+
+`TRUSTED_PROXIES` must match the deployment: too high and clients can forge their address past the limits, too low
+and every client shares the proxy's.
