@@ -1,5 +1,5 @@
 # Myriad's API. Coolify builds this as a Dockerfile application; mount a volume at /data for the database.
-FROM node:24-alpine AS build
+FROM node:25-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -7,7 +7,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM node:24-alpine
+FROM node:25-alpine
 WORKDIR /app
 ENV NODE_ENV=production DB_PATH=/data/myriad.db PORT=3000
 COPY --from=build --chown=root:root /app/node_modules ./node_modules
