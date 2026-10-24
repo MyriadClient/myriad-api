@@ -1,6 +1,6 @@
 /**
  * Checking and cleaning a shared config before it's stored: the document a Myriad client builds (`ConfigShare`,
- * format 1).
+ * format 1: modules, control panels, wheels, a theme).
  *
  * Everything is rebuilt from a whitelist: only the fields the format has are kept, each checked for its type and capped
  * in length, so nothing else can be stored and served. In particular:
@@ -17,6 +17,7 @@ export const FORMAT = 1;
 const MODULE_ID = /^[a-z0-9_.-]{1,64}:[a-z0-9_./-]{1,64}$/;
 const COLOR = /^#(?:[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/;
 const KINDS = new Set(["toggle", "number", "choice", "color", "keybind", "list", "position", "text"]);
+const SLOT_KINDS = new Set(["module", "control", "key_action", "panel", "command"]);
 const MAX_DEPTH = 8;
 
 export class InvalidShare extends Error {}
@@ -39,13 +40,14 @@ export function cleanShare(input: unknown): JsonObject {
 	const modules = list(doc.modules ?? [], "modules", 500).map((m, i) => module(m, i));
 	out.modules = modules;
 	if (doc.controlPanels !== undefined) out.controlPanels = list(doc.controlPanels, "controlPanels", 50).map((p, i) => controlPanel(p, i));
+	if (doc.wheels !== undefined) out.wheels = list(doc.wheels, "wheels", 20).map((w, i) => wheel(w, i));
 	if (doc.theme !== undefined) {
 		const t = object(doc.theme, "theme");
 		out.theme = pick({ name: optText(t.name, 80), settings: t.settings === undefined ? undefined : opaque(t.settings, "theme.settings"), view: t.view === undefined ? undefined : look(t.view) });
 	}
 	if (doc.look !== undefined) out.look = look(doc.look);
 
-	if (modules.length === 0 && out.controlPanels === undefined && out.theme === undefined) throw new InvalidShare("nothing to share");
+	if (modules.length === 0 && out.controlPanels === undefined && out.wheels === undefined && out.theme === undefined) throw new InvalidShare("nothing to share");
 	return out;
 }
 
@@ -102,6 +104,23 @@ function controlPanel(input: Json, i: number): JsonObject {
 		description: optText(p.description, 400),
 		members,
 		settings: p.settings === undefined ? undefined : opaque(p.settings, `controlPanels[${i}].settings`),
+	});
+}
+
+/** A wheel: its name, icon, keybind (opaque, read by clients) and slots, each what it runs and the name it shows. */
+function wheel(input: Json, i: number): JsonObject {
+	const w = object(input, `wheels[${i}]`);
+	const slots = list(w.slots ?? [], `wheels[${i}].slots`, 24).filter(isObject).flatMap(s => {
+		const kind = typeof s.kind === "string" && SLOT_KINDS.has(s.kind) ? s.kind : undefined;
+		const target = optText(s.target, 256);
+		if (!kind || !target) return [];
+		return [pick({ kind, target, label: optText(s.label, 80), icon: optText(s.icon, 8), name: optText(s.name, 48) })];
+	});
+	return pick({
+		name: text(w.name, `wheels[${i}].name`, 48),
+		icon: optText(w.icon, 8),
+		keybind: w.keybind === undefined ? undefined : opaque(w.keybind, `wheels[${i}].keybind`),
+		slots,
 	});
 }
 

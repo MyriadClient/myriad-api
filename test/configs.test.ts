@@ -85,6 +85,22 @@ test("unknown fields are dropped", async () => {
 	assert.ok(!text.includes("<script>") && !text.includes("<b>"));
 });
 
+test("a wheel alone is a share, its slots cleaned", async () => {
+	const app = setup();
+	const wheel = { name: "Travel", icon: "\uf1d8", slots: [
+		{ kind: "module", target: "myriad-essentials:elytra_fly", label: "Elytra Fly", extra: "<b>" },
+		{ kind: "command", target: ".baritone goto 0 0", name: "Home" },
+		{ kind: "teleport", target: "x" },
+		{ kind: "panel" },
+	] };
+	const code = await codeOf(await publish(app, { format: 1, title: "Wheel", modules: [], wheels: [wheel] }));
+	const doc = await (await get(app, code)).json() as { wheels: { name: string, slots: { kind: string, target: string, name?: string }[] }[] };
+	assert.equal(doc.wheels[0]!.name, "Travel");
+	assert.deepEqual(doc.wheels[0]!.slots.map(s => s.kind), ["module", "command"]);
+	assert.equal(doc.wheels[0]!.slots[1]!.name, "Home");
+	assert.ok(!JSON.stringify(doc).includes("<b>"));
+});
+
 test("refuses what isn't a share", async () => {
 	const app = setup();
 	assert.equal((await publish(app, { format: 2, modules: [] })).status, 400);
