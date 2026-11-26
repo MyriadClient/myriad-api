@@ -6,6 +6,7 @@ import { clientKey } from "./address.ts";
 import { CODE, hashKey, keyMatches, newCode, newDeleteKey } from "./codes.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
+import type { Library } from "./library/library.ts";
 import { RateLimit } from "./rateLimit.ts";
 import { cleanShare, InvalidShare } from "./share.ts";
 
@@ -19,11 +20,13 @@ const HOUR = 60 * MINUTE;
  * - `GET /v1/configs/:code` → the shared config
  * - `DELETE /v1/configs/:code` with `Authorization: Bearer <deleteKey>` → `204`
  *
+ * And the Myriad Library's routes (library/library.ts), when it's set up.
+ *
  * There are no accounts and no cookies, so nothing can be done in a visitor's name; what's stored is public to anyone
  * with its code. Every route is limited per client, and publishing also has a ceiling for everyone together.
  * Addresses are only kept in memory, for the limits, and never stored.
  */
-export function createApp(store: Store, config: Config, now: () => number = Date.now): Hono {
+export function createApp(store: Store, config: Config, now: () => number = Date.now, library?: Library): Hono {
 	const app = new Hono();
 	const limits = {
 		uploadsHour: new RateLimit(config.uploadsPerHour, HOUR),
@@ -110,6 +113,8 @@ export function createApp(store: Store, config: Config, now: () => number = Date
 		store.deleteShare(code);
 		return c.body(null, 204);
 	});
+
+	if (library) app.route("/", library.app);
 
 	return app;
 }

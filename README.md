@@ -1,6 +1,6 @@
 # Myriad API
 
-The web API behind [Myriad](https://myriadclient.dev/): shared configs for now, accounts later. A small TypeScript
+The web API behind [Myriad](https://myriadclient.dev/): shared configs and the Myriad Library. A small TypeScript
 service (Hono on Node 24, SQLite through Node's built-in `node:sqlite`), deployed on Coolify at
 `https://api.myriadclient.dev`.
 
@@ -47,3 +47,36 @@ A Dockerfile application from this repository, with a persistent volume at `/dat
 and every client shares the proxy's. **Behind Cloudflare's proxy (orange cloud) and Coolify's Traefik, set it to 2.**
 Then also allow only Cloudflare's addresses to reach the server directly (a firewall rule, or a Cloudflare Tunnel):
 a request that skips Cloudflare could otherwise put an address of its choosing in the second-to-last place.
+
+The API keeps a daily copy of its database in `/data/backups` (the last seven). That guards against bad writes, not
+against losing the server: copy `/data/backups` off the server too.
+
+## The Myriad Library
+
+The Library (`src/library/`) lists addons Myriad has checked, for the client's Browse button and the website. The API
+never signs a listing or a version: the maintainer's listing key and the public builder's version key do, and the API
+accepts them only when the right key, certified by Myriad's root keys, signed them. It signs only the index (which
+listings and versions are current) with the index key, every hour and on each change.
+
+| | |
+|---|---|
+| `GET /v1/index.json` | the signed index (ETag, `max-age=300`) |
+| `GET /v1/library/addons[/:id[/icon.png]]` | listings for the website |
+| `POST /v1/github/webhook` | the Myriad Library GitHub App's events (HMAC checked, each delivery once) |
+| `/v1/library/builds/:id[/started\|/result\|/source-token]` | the builders, each with its own token |
+| `/v1/library/pending`, `/submissions/:id/accept\|reject`, `/approvals`, `/yank`, `/listings/:id/pause` | the maintainer (admin token) |
+
+Each part is off until its settings are set (tokens are given as SHA-256 hex hashes, so the server never holds them):
+
+| | |
+|---|---|
+| `LIBRARY_INDEX_KEY` | `ed25519-private:...`, the index key (its certificate is posted to `/approvals`) |
+| `LIBRARY_ADMIN_TOKEN_SHA256` | the maintainer's token, hashed |
+| `LIBRARY_BUILDER_OPEN_TOKEN_SHA256`, `LIBRARY_BUILDER_CLOSED_TOKEN_SHA256` | the two builders' tokens, hashed |
+| `GITHUB_WEBHOOK_SECRET` | the Library App's webhook secret |
+| `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | the Library App (PEM, newlines as `\n`) |
+| `GITHUB_DISPATCH_APP_ID`, `GITHUB_DISPATCH_PRIVATE_KEY`, `GITHUB_DISPATCH_INSTALLATION_ID` | the private App that starts builder runs |
+| `LIBRARY_BUILDER_OPEN_REPO`, `LIBRARY_BUILDER_CLOSED_REPO` | `MyriadClient/myriad-builder`, `MyriadClient/myriad-builder-private` |
+| `MYRIAD_OWNER_ID` | GitHub's number for the MyriadClient organisation (its repositories may use Myriad's reserved ids) |
+| `WEBSITE_DEPLOY_HOOK`, `WEBSITE_DEPLOY_TOKEN` | rebuild the website when listings change (at most every ten minutes) |
+| `LIBRARY_SUBMISSIONS_PER_DAY` | releases one installation may submit a day (20) |

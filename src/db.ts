@@ -1,6 +1,7 @@
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { migrate } from "./migrate.ts";
 
 /** A stored share: the document as sent (cleaned), and the hash of the key that deletes it. */
 export interface ShareRow {
@@ -13,20 +14,13 @@ export interface ShareRow {
 
 /** The API's storage: one SQLite file, its tables made (or brought up to date) on open. */
 export class Store {
-	private readonly db: DatabaseSync;
+	readonly db: DatabaseSync;
 
 	constructor(path: string) {
 		if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
 		this.db = new DatabaseSync(path);
 		this.db.exec("PRAGMA journal_mode = WAL");
-		this.db.exec(`
-			CREATE TABLE IF NOT EXISTS shares (
-				code        TEXT PRIMARY KEY,
-				document    TEXT NOT NULL,
-				delete_hash TEXT NOT NULL,
-				created_at  INTEGER NOT NULL,
-				views       INTEGER NOT NULL DEFAULT 0
-			)`);
+		migrate(this.db);
 	}
 
 	insertShare(row: Omit<ShareRow, "views">): boolean {
@@ -60,6 +54,18 @@ export class Store {
 
 	deleteShare(code: string): void {
 		this.db.prepare("DELETE FROM shares WHERE code = ?").run(code);
+	}
+
+	/**
+	 * A copy of the whole database at `dir/myriad-<date>.db` (SQLite's `VACUUM INTO`, consistent while the API runs),
+	 * keeping the newest `keep`. Local, against bad writes; copies off the server are made outside the API.
+	 */
+	backup(dir: string, date: Date, keep = 7): void {
+		mkdirSync(dir, { recursive: true });
+		const file = join(dir, `myriad-${date.toISOString().slice(0, 10)}.db`);
+		if (!existsSync(file)) this.db.prepare("VACUUM INTO ?").run(file);
+		const old = readdirSync(dir).filter(f => /^myriad-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort().slice(0, -keep);
+		for (const f of old) rmSync(join(dir, f));
 	}
 
 	close(): void {
