@@ -64,7 +64,7 @@ listings and versions are current) with the index key, every hour and on each ch
 | `GET /v1/library/addons[/:id[/icon.png]]` | listings for the website |
 | `POST /v1/github/webhook` | the Myriad Library GitHub App's events (HMAC checked, each delivery once) |
 | `/v1/library/builds/:id[/started\|/result\|/source-token]` | the builders, each with its own token |
-| `/v1/library/pending`, `/submissions/:id/accept\|reject`, `/approvals`, `/yank`, `/listings/:id/pause` | the maintainer (admin token) |
+| `/v1/library/pending`, `/submissions/:id/accept\|reject`, `/approvals`, `/listings/:id/pause` | the maintainer (admin token; approvals carry their own signatures) |
 
 Each part is off until its settings are set (tokens are given as SHA-256 hex hashes, so the server never holds them):
 

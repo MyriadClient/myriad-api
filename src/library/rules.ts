@@ -1,6 +1,6 @@
 import type { LibraryStore, ListingRow } from "./store.ts";
 import {
-	ID, InvalidStatement, isKey, keyCertBytes, listingBytes, releaseBytes, revocationsBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes,
+	acceptedBytes, ID, InvalidStatement, isKey, keyCertBytes, listingBytes, releaseBytes, revocationsBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes,
 	type KeyCert, type Listing, type privateKey, type Role, type Sig,
 } from "./statements.ts";
 
@@ -70,7 +70,7 @@ export function shown(v: unknown, max: number): string {
 	if (typeof v !== "string") return "";
 	const cleaned = [...v].filter(ch => {
 		const c = ch.codePointAt(0)!;
-		return !(c < 0x20 || (c >= 0x7f && c < 0xa0) || c === 0xa7 || (c >= 0x200b && c <= 0x200f) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2060 && c <= 0x206f) || c === 0x2028 || c === 0x2029 || c === 0xfeff);
+		return !(c < 0x20 || (c >= 0x7f && c < 0xa0) || c === 0xa7 || (c >= 0xe000 && c <= 0xf8ff) || c >= 0xf0000 || (c >= 0x200b && c <= 0x200f) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2060 && c <= 0x206f) || c === 0x2028 || c === 0x2029 || c === 0xfeff);
 	});
 	return cleaned.slice(0, max).join("").trim();
 }
@@ -108,15 +108,27 @@ export function acceptListing(store: LibraryStore, roots: string[], body: unknow
 	if (!signer(listingBytes(l), s, keys(store, roots, Math.floor(now / 1000)).listing)) throw new Refused("the listing isn't signed by a Myriad listing key");
 	const before = store.listing(l.id);
 	if (before && l.revision <= before.revision) throw new Refused("not newer than the listing already held");
+	for (const other of store.listings(true)) {
+		if (other.id === l.id) continue;
+		const theirs = new Set([other.id, ...other.provides]);
+		const clash = [l.id, ...l.provides].find(n => theirs.has(n));
+		if (clash) throw new Refused(`${clash} is already listed as ${other.id}`);
+		if (other.repoId === l.repoId) throw new Refused(`that repository is already listed as ${other.id}`);
+	}
 	const info = o.info === undefined ? {} : obj(o.info, "info");
 	const repoName = shown(info.repo, 201);
 	if (o.accepted !== undefined && (!Array.isArray(o.accepted) || o.accepted.length > 200)) throw new Refused("accepted findings aren't a short list");
 	const accepted = ((o.accepted ?? []) as unknown[]).map(f => {
-		if (typeof f !== "string" || !/^[ -~]{1,300}$/.test(f)) throw new Refused("an accepted finding isn't one");
+		if (typeof f !== "string" || !/^[!-<>-~]{1,300}$/.test(f)) throw new Refused("an accepted finding isn't one");
 		return f;
 	});
+	// Accepted findings let later versions through unreviewed, so the listing key signs them too.
+	const acceptedSigs = accepted.length === 0 ? [] : sigs(o.acceptedSignatures);
+	if (accepted.length > 0 && !signer(acceptedBytes(l.id, l.revision, accepted), acceptedSigs, keys(store, roots, Math.floor(now / 1000)).listing)) {
+		throw new Refused("the accepted findings aren't signed by a Myriad listing key");
+	}
 	const row = {
-		...l, provides: [...new Set(l.provides)].sort(), keys: [...new Set(l.keys)].sort(), sigs: s, accepted: [...new Set(accepted)].sort(),
+		...l, provides: [...new Set(l.provides)].sort(), keys: [...new Set(l.keys)].sort(), sigs: s, accepted: [...new Set(accepted)].sort(), acceptedSigs,
 		name: shown(info.name, 64) || l.id, description: shown(info.description, 300), author: shown(info.author, 64),
 		repoName: /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/.test(repoName) ? repoName : before?.repoName ?? "",
 	};
@@ -132,7 +144,7 @@ export function acceptVersion(store: LibraryStore, roots: string[], body: unknow
 	const o = obj(body, "the version");
 	const id = str(o.id, "id", 64);
 	const listing = store.listing(id);
-	if (!listing || listing.paused) throw new Refused("no listing for that id");
+	if (!listing || !listingLive(store, listing)) throw new Refused("no listing for that id");
 	const v = { id, version: str(o.version, "version", 64), size: Number(o.size), sha256: str(o.sha256, "sha256", 64), commit: str(o.commit, "commit", 40) };
 	const s = sigs(o.signatures);
 	const k = keys(store, roots, Math.floor(now / 1000));
@@ -141,7 +153,7 @@ export function acceptVersion(store: LibraryStore, roots: string[], body: unknow
 	const developer = sigs(o.developer);
 	if (!signer(releaseBytes(v), developer, listing.keys)) throw new Refused("the version isn't signed by the listing's developer");
 	if (!downloadable(o.url)) throw new Refused("the version isn't downloadable from a GitHub release");
-	const minecraft = o.minecraft === undefined || o.minecraft === null ? null : str(o.minecraft, "minecraft", 200);
+	const minecraft = o.minecraft === undefined || o.minecraft === null ? null : shown(str(o.minecraft, "minecraft", 200), 200) || null;
 	const held = store.version(id, v.version);
 	if (held) {
 		if (held.sha256 !== v.sha256) throw new Refused("that version is already listed with a different jar");
@@ -160,16 +172,22 @@ export function acceptYank(store: LibraryStore, roots: string[], body: unknown, 
 	const y = { id, version: str(o.version, "version", 64), sha256: str(o.sha256, "sha256", 64) };
 	const s = sigs(o.signatures);
 	const k = keys(store, roots, Math.floor(now / 1000));
-	if (!signer(yankBytes(y), s, [...k.listing, ...k.version, ...k.index, ...listing.keys])) throw new Refused("the yank isn't signed by a key that may yank");
+	// Only the offline listing key and the addon's own developer keys: a yank is kept forever, so no online key may make one.
+	if (!signer(yankBytes(y), s, [...k.listing, ...listing.keys])) throw new Refused("the yank isn't signed by a key that may yank");
 	store.addYank({ listingId: id, version: y.version, sha256: y.sha256, sigs: s }, now);
 }
 
-/** Yanks with the index key, for the maintainer's quick takedowns (yanking only ever takes away). */
-export function yankWithIndexKey(store: LibraryStore, indexKey: ReturnType<typeof privateKey>, id: string, version: string, now: number): void {
-	const v = store.version(id, version);
-	if (!v) throw new Refused("no such version");
-	const y = { id, version, sha256: v.sha256 };
-	store.addYank({ listingId: id, version, sha256: v.sha256, sigs: [signWith(indexKey, yankBytes(y))] }, now);
+/**
+ * Whether a listing's repositories are still what it was approved for: known, not removed, owned by the listing's owner,
+ * and (open source) public. Checked from state, so a missed GitHub event can't leave a transferred repository listed.
+ */
+export function listingLive(store: LibraryStore, l: ListingRow): boolean {
+	if (l.paused) return false;
+	const ok = (id: number, mustBePublic: boolean) => {
+		const r = store.repo(id);
+		return r !== undefined && !r.removed && r.ownerId === l.ownerId && !(mustBePublic && r.private);
+	};
+	return l.source === "open" ? ok(l.repoId, true) : ok(l.repoId, false) && ok(l.downloadRepoId, true);
 }
 
 /**
@@ -185,7 +203,7 @@ export function buildSnapshot(store: LibraryStore, indexKey: ReturnType<typeof p
 		expires: issued + SNAPSHOT_LIFE,
 		certs: store.certs().map(c => ({ key: c.key, role: c.role, ...(c.role === "index" ? { notAfter: c.notAfter } : {}), signatures: c.sigs })),
 		...(rev ? { revocations: { seq: rev.seq, keys: rev.keys, signatures: rev.sigs } } : {}),
-		addons: store.listings().map(l => ({
+		addons: store.listings().filter(l => listingLive(store, l)).map(l => ({
 			listing: {
 				id: l.id, revision: l.revision, repoId: l.repoId, ownerId: l.ownerId, source: l.source,
 				...(l.source === "closed" ? { downloadRepoId: l.downloadRepoId } : {}), build: l.build, provides: l.provides, keys: l.keys, signatures: l.sigs,

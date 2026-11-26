@@ -10,6 +10,8 @@ export interface ListingRow extends Listing {
 	repoName: string;
 	/** Inspection findings the maintainer accepted for this listing: they don't hold up its next versions. */
 	accepted: string[];
+	/** The listing key's signatures over `accepted` (an `accepted` statement for this id and revision). */
+	acceptedSigs: Sig[];
 	paused: boolean;
 	updatedAt: number;
 }
@@ -129,11 +131,14 @@ export class LibraryStore {
 		return repos;
 	}
 
-	putRepo(r: Omit<RepoRow, "removed">, now: number): void {
+	/** Records a repository; true when it was known before under another owner (transferred). */
+	putRepo(r: Omit<RepoRow, "removed">, now: number): boolean {
+		const before = this.repo(r.id);
 		this.db.prepare(`INSERT INTO library_repos (id, installation_id, owner_id, full_name, private, updated_at) VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET installation_id = excluded.installation_id, owner_id = excluded.owner_id, full_name = excluded.full_name,
 			private = excluded.private, updated_at = excluded.updated_at, removed_at = NULL`)
 			.run(r.id, r.installationId, r.ownerId, r.fullName, r.private ? 1 : 0, now);
+		return before !== undefined && before.ownerId !== r.ownerId;
 	}
 
 	removeRepo(id: number, now: number): void {
@@ -158,14 +163,14 @@ export class LibraryStore {
 	// ---- listings ---------------------------------------------------------------------------------------------------
 
 	putListing(l: Omit<ListingRow, "paused" | "updatedAt">, now: number): void {
-		this.db.prepare(`INSERT INTO library_listings (id, revision, repo_id, owner_id, source, download_repo_id, build, provides, keys, sigs, name, description, author, repo_name, accepted, paused, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+		this.db.prepare(`INSERT INTO library_listings (id, revision, repo_id, owner_id, source, download_repo_id, build, provides, keys, sigs, name, description, author, repo_name, accepted, accepted_sigs, paused, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
 			ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, repo_id = excluded.repo_id, owner_id = excluded.owner_id, source = excluded.source,
 			download_repo_id = excluded.download_repo_id, build = excluded.build, provides = excluded.provides, keys = excluded.keys, sigs = excluded.sigs,
 			name = excluded.name, description = excluded.description, author = excluded.author, repo_name = excluded.repo_name, accepted = excluded.accepted,
-			paused = 0, updated_at = excluded.updated_at`)
+			accepted_sigs = excluded.accepted_sigs, paused = 0, updated_at = excluded.updated_at`)
 			.run(l.id, l.revision, l.repoId, l.ownerId, l.source, l.downloadRepoId, l.build, json(l.provides), json(l.keys), json(l.sigs),
-				l.name, l.description, l.author, l.repoName, json(l.accepted), now);
+				l.name, l.description, l.author, l.repoName, json(l.accepted), json(l.acceptedSigs), now);
 	}
 
 	listing(id: string): ListingRow | undefined {
@@ -279,6 +284,19 @@ export class LibraryStore {
 		this.db.prepare("INSERT INTO library_jobs (kind, payload, run_after) VALUES (?, ?, ?)").run(kind, json(payload), runAfter);
 	}
 
+	hasPendingJob(kind: string): boolean {
+		return this.db.prepare("SELECT 1 FROM library_jobs WHERE done = 0 AND kind = ? LIMIT 1").get(kind) !== undefined;
+	}
+
+	/** Builds dispatched since `since` and not finished: all of them, or one installation's. */
+	activeBuilds(since: number, installationId?: number): number {
+		const r = (installationId === undefined
+			? this.db.prepare("SELECT COUNT(*) AS n FROM library_submissions WHERE status IN ('queued', 'building') AND dispatched_at >= ?").get(since)
+			: this.db.prepare(`SELECT COUNT(*) AS n FROM library_submissions s JOIN library_repos r ON r.id = s.repo_id
+				WHERE s.status IN ('queued', 'building') AND s.dispatched_at >= ? AND r.installation_id = ?`).get(since, installationId)) as { n: number };
+		return Number(r.n);
+	}
+
 	dueJobs(now: number, limit = 20): JobRow[] {
 		return (this.db.prepare("SELECT id, kind, payload, attempts FROM library_jobs WHERE done = 0 AND run_after <= ? ORDER BY id LIMIT ?").all(now, limit) as Row[])
 			.map(r => ({ id: Number(r.id), kind: String(r.kind), payload: parse(r.payload), attempts: Number(r.attempts) }));
@@ -310,7 +328,7 @@ function listingOf(r: Row): ListingRow {
 		id: String(r.id), revision: Number(r.revision), repoId: Number(r.repo_id), ownerId: Number(r.owner_id), source: String(r.source) as Source,
 		downloadRepoId: Number(r.download_repo_id), build: String(r.build), provides: parse<string[]>(r.provides), keys: parse<string[]>(r.keys),
 		sigs: parse<Sig[]>(r.sigs), name: String(r.name), description: String(r.description), author: String(r.author), repoName: String(r.repo_name),
-		accepted: parse<string[]>(r.accepted), paused: Number(r.paused) === 1, updatedAt: Number(r.updated_at),
+		accepted: parse<string[]>(r.accepted), acceptedSigs: parse<Sig[]>(r.accepted_sigs), paused: Number(r.paused) === 1, updatedAt: Number(r.updated_at),
 	};
 }
 

@@ -9,10 +9,10 @@ import type { LibraryConfig } from "../src/library/config.ts";
 import type { CheckRun, GitHub } from "../src/library/github.ts";
 import { createLibrary } from "../src/library/library.ts";
 import {
-	keyCertBytes, listingBytes, privateKey, releaseBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes, type Listing,
+	acceptedBytes, keyCertBytes, listingBytes, privateKey, releaseBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes, type Listing,
 } from "../src/library/statements.ts";
 import { hashKey } from "../src/codes.ts";
-import { migrate } from "../src/migrate.ts";
+import { migrate, SCHEMA_VERSION } from "../src/migrate.ts";
 
 const key = (n: number) => privateKey(`ed25519-private:${Buffer.alloc(32, n).toString("base64url")}`);
 const ROOT = key(1), LISTING = key(2), VERSION = key(3), INDEX = key(4), DEV = key(5), OTHER = key(7);
@@ -93,6 +93,9 @@ function versionDoc(version: string, sha = sha256Hex(version), by = VERSION, dev
 }
 
 async function ready(app: App) {
+	// The listed repository, known from the App's installation, owned by the listing's owner.
+	const repos = [{ id: 100, full_name: "dev/good-addon" }, { id: 101, full_name: "dev/closed-addon", private: true }, { id: 102, full_name: "dev/closed-addon-releases" }];
+	assert.equal((await hook(app, "installation", installation(repos))).status, 202);
 	for (const c of [cert(LISTING, "listing"), cert(VERSION, "version"), cert(INDEX, "index")]) assert.equal((await req(app, "POST", "/v1/library/approvals", c, ADMIN)).status, 200);
 }
 
@@ -132,7 +135,7 @@ test("a database from before migrations keeps its shares", () => {
 	db.exec("INSERT INTO shares (code, document, delete_hash, created_at) VALUES ('myriad_abcdef', '{}', 'x', 1)");
 	migrate(db);
 	assert.equal((db.prepare("SELECT COUNT(*) AS n FROM shares").get() as { n: number }).n, 1);
-	assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
+	assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, SCHEMA_VERSION);
 	migrate(db); // again: nothing to do
 	db.exec("PRAGMA user_version = 99");
 	assert.throws(() => migrate(db));
@@ -159,6 +162,21 @@ test("index issue times always move forward", async () => {
 	const a = (await index(app)).body.issued;
 	assert.equal((await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN)).status, 200);
 	assert.ok((await index(app)).body.issued > a);
+});
+
+test("a storm of changes can't push the index ahead of the clock", async () => {
+	const { app, now } = setup();
+	await ready(app);
+	await hook(app, "installation", installation([{ id: 300, full_name: "dev/x" }]));
+	for (let i = 0; i < 150; i++) {
+		const r = { id: 100, full_name: `dev/good-addon-${i}`, owner: { id: 200 } };
+		await hook(app, "repository", { action: "renamed", installation: { id: 5 }, repository: r });
+	}
+	assert.equal((await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN)).status, 200);
+	for (let i = 0; i < 150; i++) {
+		await hook(app, "repository", { action: "renamed", installation: { id: 5 }, repository: { id: 100, full_name: `dev/good-addon-${i}`, owner: { id: 200 } } });
+	}
+	assert.ok((await index(app)).body.issued <= Math.floor(now() / 1000) + 60);
 });
 
 test("no index before the Library is set up", async () => {
@@ -245,12 +263,43 @@ test("a signed result lists the version and rebuilds the index", async () => {
 	await hook(app, "release", released(100, "dev/good-addon", "v1.1.0"));
 	await library.tick();
 	const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(20)]);
-	const res = await req(app, "POST", "/v1/library/builds/1/result", { outcome: "signed", version: versionDoc("1.1.0"), icon: png.toString("base64") }, OPEN);
+	const asset = "https://github.com/dev/good-addon/releases/download/v1.1.0/x-1.0.0.jar";
+	const res = await req(app, "POST", "/v1/library/builds/1/result", { outcome: "signed", version: { ...versionDoc("1.1.0"), url: asset }, icon: png.toString("base64") }, OPEN);
 	assert.equal(res.status, 200);
 	assert.equal(library.store.submission(1)?.status, "signed");
 	assert.equal((await index(app)).body.addons[0].versions[0].version, "1.1.0");
 	assert.equal((await req(app, "GET", "/v1/library/addons/good-addon/icon.png")).headers.get("content-type"), "image/png");
 	assert.equal((await req(app, "POST", "/v1/library/builds/1/result", { outcome: "failed" }, OPEN)).status, 404, "a finished build takes no more results");
+});
+
+test("a builder's result counts only for its own release", async () => {
+	const { app, library } = setup();
+	await ready(app);
+	await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN);
+	await req(app, "POST", "/v1/library/approvals", listingDoc({ id: "other-addon", repoId: 102, ownerId: 200 }), ADMIN);
+	await hook(app, "release", released(100, "dev/good-addon", "v1.1.0"));
+	await hook(app, "release", released(100, "dev/good-addon", "v1.2.0"));
+	await library.tick();
+	const at = (tag: string) => `https://github.com/dev/good-addon/releases/download/${tag}/x-1.0.0.jar`;
+	const other = { ...versionDoc("1.1.0", undefined, VERSION, DEV, "other-addon"), url: at("v1.1.0") };
+	assert.equal((await req(app, "POST", "/v1/library/builds/1/result", { outcome: "signed", version: other }, OPEN)).status, 422, "another listing's id");
+	const elsewhere = { ...versionDoc("1.2.0"), url: at("v1.1.0") };
+	assert.equal((await req(app, "POST", "/v1/library/builds/2/result", { outcome: "signed", version: elsewhere }, OPEN)).status, 422, "another release's jar");
+	assert.equal(library.store.version("good-addon", "1.2.0"), undefined);
+});
+
+test("a repository that changes owner is paused, even when GitHub never said it was transferred", async () => {
+	const { app, library } = setup();
+	await ready(app);
+	await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN);
+	assert.equal((await index(app)).body.addons.length, 1);
+	// The new owner installs the App: the repository is now theirs.
+	await hook(app, "installation", { action: "created", installation: { id: 6, account: { id: 333, login: "new" } }, repositories: [{ id: 100, full_name: "new/good-addon" }] });
+	assert.equal(library.store.listing("good-addon")?.paused, true);
+	assert.equal((await index(app)).body.addons.length, 0);
+	await hook(app, "release", { ...released(100, "new/good-addon", "v2.0.0"), installation: { id: 6 } });
+	await library.tick();
+	assert.equal(library.store.submission(1), undefined, "nothing is built for it");
 });
 
 test("the closed builder only reviews, and gets one short-lived token for one repository", async () => {
@@ -292,19 +341,34 @@ test("a transferred repository pauses its listing and drops it from the index", 
 	assert.equal((await req(app, "GET", "/v1/library/addons/good-addon")).status, 404);
 });
 
-test("the maintainer can yank with the index key; the yank is in the index", async () => {
+test("yanks need the listing key or the developer's; the online keys can't make one", async () => {
 	const { app } = setup();
 	await ready(app);
 	await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN);
 	await req(app, "POST", "/v1/library/approvals", { kind: "version", doc: versionDoc("1.0.0") }, ADMIN);
-	assert.equal((await req(app, "POST", "/v1/library/yank", { id: "good-addon", version: "1.0.0" })).status, 403);
-	assert.equal((await req(app, "POST", "/v1/library/yank", { id: "good-addon", version: "1.0.0" }, ADMIN)).status, 200);
-	const y = (await index(app)).body.addons[0].yanks[0];
-	assert.ok(signer(yankBytes({ id: "good-addon", version: "1.0.0", sha256: sha256Hex("1.0.0") }), y.signatures, [INDEX.publicText]));
-	// A developer may yank their own release too.
-	const dev = { id: "good-addon", version: "1.0.0", sha256: sha256Hex("1.0.0") };
-	assert.equal((await req(app, "POST", "/v1/library/approvals", { kind: "yank", doc: { ...dev, signatures: [signWith(DEV, yankBytes(dev))] } }, ADMIN)).status, 200);
-	assert.equal((await req(app, "POST", "/v1/library/approvals", { kind: "yank", doc: { ...dev, signatures: [signWith(OTHER, yankBytes(dev))] } }, ADMIN)).status, 422);
+	const y = { id: "good-addon", version: "1.0.0", sha256: sha256Hex("1.0.0") };
+	const post = (by: ReturnType<typeof key>, token = ADMIN) => req(app, "POST", "/v1/library/approvals", { kind: "yank", doc: { ...y, signatures: [signWith(by, yankBytes(y))] } }, token);
+	assert.equal((await post(LISTING, OPEN)).status, 403, "the maintainer's route");
+	assert.equal((await post(INDEX)).status, 422, "not the index key");
+	assert.equal((await post(VERSION)).status, 422, "nor the version key");
+	assert.equal((await post(OTHER)).status, 422);
+	assert.equal((await post(LISTING)).status, 200);
+	assert.ok(signer(yankBytes(y), (await index(app)).body.addons[0].yanks[0].signatures, [LISTING.publicText]));
+	assert.equal((await post(DEV)).status, 200, "a developer may yank their own release");
+	assert.equal((await req(app, "POST", "/v1/library/yank", { id: "good-addon", version: "1.0.0" }, ADMIN)).status, 404, "no index-key yanks");
+});
+
+test("accepted findings need the listing key's signature, for that listing and revision", async () => {
+	const { app, library } = setup();
+	await ready(app);
+	const doc = listingDoc();
+	const found = ["process", "host:example.com"];
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...doc, doc: { ...doc.doc, accepted: found } }, ADMIN)).status, 422, "unsigned");
+	const other = [signWith(LISTING, acceptedBytes("good-addon", 2, found))];
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...doc, doc: { ...doc.doc, accepted: found, acceptedSignatures: other } }, ADMIN)).status, 422, "another revision's");
+	const good = [signWith(LISTING, acceptedBytes("good-addon", 1, found))];
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...doc, doc: { ...doc.doc, accepted: found, acceptedSignatures: good } }, ADMIN)).status, 200);
+	assert.deepEqual(library.store.listing("good-addon")?.acceptedSigs, good);
 });
 
 test("Myriad's reserved ids are only for Myriad's own repositories", async () => {
@@ -327,4 +391,15 @@ test("deploys are debounced", async () => {
 	await ready(app);
 	await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN);
 	assert.equal(library.store.dueJobs(Number.MAX_SAFE_INTEGER).filter(j => j.kind === "deploy").length, 1);
+});
+
+test("one installation can't hold more than two builders at once", async () => {
+	const { app, library, github } = setup();
+	await ready(app);
+	for (const tag of ["v1.0.0", "v1.0.1", "v1.0.2"]) await hook(app, "release", released(100, "dev/good-addon", tag));
+	await library.tick();
+	assert.equal(github.dispatched.length, 2);
+	await req(app, "POST", "/v1/library/builds/1/result", { outcome: "failed", reason: "x" }, OPEN);
+	await library.tick();
+	assert.equal(github.dispatched.length, 3, "the third goes once one finishes");
 });

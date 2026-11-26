@@ -7,7 +7,7 @@ import { RateLimit } from "../rateLimit.ts";
 import type { LibraryConfig } from "./config.ts";
 import { type CheckRun, type GitHub, webhookSignatureValid } from "./github.ts";
 import {
-	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, downloadable, Refused, shown, yankWithIndexKey,
+	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, downloadable, listingLive, Refused, shown,
 } from "./rules.ts";
 import { InvalidStatement, privateKey } from "./statements.ts";
 import { type Builder, LibraryStore, type ListingRow, type SubmissionRow } from "./store.ts";
@@ -18,6 +18,12 @@ const TAG = /^[A-Za-z0-9._+-]{1,100}$/;
 const REPO = /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/;
 const TOKEN = /^Bearer ([A-Za-z0-9_-]{20,128})$/;
 const MAX_ICON = 64 * 1024;
+/** Builds running at once: all together, and for one installation, so one account can't hold every builder. */
+const MAX_BUILDS = 6;
+const MAX_BUILDS_EACH = 2;
+
+/** A dispatch that waits for a free builder. */
+class Busy extends Error {}
 
 export interface Library {
 	app: Hono;
@@ -39,7 +45,7 @@ export interface Library {
  * GitHub: `POST /v1/github/webhook`.
  * Builders (their own token): `GET /v1/library/builds/:id`, `POST .../started`, `.../result`, `.../source-token`.
  * Maintainer (admin token): `GET /v1/library/pending`, `POST /v1/library/submissions/:id/accept|reject`,
- * `POST /v1/library/approvals`, `POST /v1/library/yank`, `POST /v1/library/listings/:id/pause`.
+ * `POST /v1/library/approvals` (signed listings, versions, yanks, certificates), `POST /v1/library/listings/:id/pause`.
  */
 export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: GitHub | undefined, trustedProxies: number, now: () => number = Date.now): Library {
 	const lib = new LibraryStore(db);
@@ -49,12 +55,24 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 	const writes = new RateLimit(60, MINUTE);
 	const who = (c: Context) => clientKey(c.req.header("x-forwarded-for"), socketAddress(c), trustedProxies);
 
+	// Each rebuild moves `issued` on by at least a second. However many changes arrive, it never gets more than a minute
+	// ahead of the clock (clients refuse an index from more than a day ahead): past that, rebuilds wait.
+	let later: ReturnType<typeof setTimeout> | undefined;
 	const rebuild = () => {
-		if (indexKey) buildSnapshot(lib, indexKey, now());
+		if (!indexKey) return;
+		const last = lib.snapshot();
+		if (last && last.issued >= Math.floor(now() / 1000) + 60) {
+			later ??= setTimeout(() => {
+				later = undefined;
+				rebuild();
+			}, 1000);
+			later.unref?.();
+			return;
+		}
+		buildSnapshot(lib, indexKey, now());
 	};
 	const deploySoon = () => {
-		if (!config.deployHook) return;
-		if (lib.dueJobs(Number.MAX_SAFE_INTEGER, 100).some(j => j.kind === "deploy")) return;
+		if (!config.deployHook || lib.hasPendingJob("deploy")) return;
 		lib.addJob("deploy", {}, now() + 10 * MINUTE);
 	};
 	const changed = () => {
@@ -82,13 +100,13 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		// The website's build reads a 404 here as "not open yet".
 		if (!indexKey && !lib.snapshot()) return c.json({ error: "The Library isn't open yet" }, 404);
 		c.header("Cache-Control", "public, max-age=300");
-		return c.json(lib.listings().map(l => summary(lib, l)));
+		return c.json(lib.listings().filter(l => listingLive(lib, l)).map(l => summary(lib, l)));
 	});
 
 	app.get("/v1/library/addons/:id", c => {
 		if (!reads.tryHit(who(c), now())) return tooMany(c);
 		const l = lib.listing(c.req.param("id"));
-		if (!l || l.paused) return c.json({ error: "No such addon" }, 404);
+		if (!l || !listingLive(lib, l)) return c.json({ error: "No such addon" }, 404);
 		const yanked = new Set(lib.yanks(l.id).map(y => `${y.version}/${y.sha256}`));
 		c.header("Cache-Control", "public, max-age=300");
 		return c.json({
@@ -103,7 +121,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 	app.get("/v1/library/addons/:id/icon.png", c => {
 		if (!reads.tryHit(who(c), now())) return tooMany(c);
 		const l = lib.listing(c.req.param("id"));
-		const png = l && !l.paused ? lib.icon(l.id) : undefined;
+		const png = l && listingLive(lib, l) ? lib.icon(l.id) : undefined;
 		if (!png) return c.json({ error: "No icon" }, 404);
 		return c.body(new Uint8Array(png), 200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=3600" });
 	});
@@ -116,15 +134,19 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		if (!webhookSignatureValid(config.webhookSecret, body, c.req.header("x-hub-signature-256"))) return c.json({ error: "Bad signature" }, 401);
 		const guid = c.req.header("x-github-delivery") ?? "";
 		if (!/^[0-9a-f-]{8,64}$/i.test(guid)) return c.json({ error: "No delivery id" }, 400);
-		if (!lib.firstDelivery(guid, now())) return c.json({ ok: true, seen: true });
 		let payload: Record<string, any>;
 		try {
 			payload = JSON.parse(body.toString("utf8"));
 		} catch {
 			return c.json({ error: "Not JSON" }, 400);
 		}
-		lib.transaction(() => onEvent(c.req.header("x-github-event") ?? "", payload));
-		return c.json({ ok: true }, 202);
+		// The delivery is recorded with what it did, so one that fails can be redelivered.
+		const first = lib.transaction(() => {
+			if (!lib.firstDelivery(guid, now())) return false;
+			onEvent(c.req.header("x-github-event") ?? "", payload);
+			return true;
+		});
+		return first ? c.json({ ok: true }, 202) : c.json({ ok: true, seen: true });
 	});
 
 	function onEvent(event: string, p: Record<string, any>): void {
@@ -152,7 +174,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 			if (p.action === "renamed" && REPO.test(String(r.full_name))) {
 				addRepo(r, installation, Number(r.owner?.id), t);
 				lib.setRepoName(id, String(r.full_name), t);
-				changed();
+				if (lib.listingForRepo(id)) changed();
 			} else if (["transferred", "privatized", "deleted"].includes(p.action)) {
 				if (p.action === "deleted") lib.removeRepo(id, t);
 				else addRepo(r, installation, Number(r.owner?.id), t);
@@ -167,7 +189,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		const id = Number(r?.id);
 		const owner = Number(r?.owner?.id ?? ownerId);
 		if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(owner) || owner <= 0 || !REPO.test(String(r?.full_name))) return;
-		lib.putRepo({ id, installationId: installation, ownerId: owner, fullName: String(r.full_name), private: r.private === true }, t);
+		if (lib.putRepo({ id, installationId: installation, ownerId: owner, fullName: String(r.full_name), private: r.private === true }, t)) pause(id);
 	}
 
 	function pause(repoId: number): void {
@@ -188,6 +210,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		if (rel?.draft || rel?.prerelease || !TAG.test(String(rel?.tag_name))) return;
 		if (lib.submissionsToday(installation, t - 24 * HOUR) >= config.submissionsPerDay) return;
 		const listing = lib.listingForRepo(repoId);
+		if (listing && !listingLive(lib, listing)) return; // paused, or no longer its approved owner's
 		let builder: Builder, status: SubmissionRow["status"];
 		if (listing?.source === "closed") {
 			if (listing.downloadRepoId !== repoId) return; // its jars come from its public releases repository
@@ -244,6 +267,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 			source: source ? { id: source.id, fullName: source.fullName, ownerId: source.ownerId, private: source.private } : null,
 			listing: listing ? signedListing(listing) : null,
 			accepted: listing?.accepted ?? [],
+			acceptedSignatures: listing?.acceptedSigs ?? [],
 		});
 	});
 
@@ -282,9 +306,11 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		if (body.outcome === "signed") {
 			if (b.builder !== "open") return c.json({ error: "Not allowed" }, 403);
 			try {
+				const own = lib.listingForRepo(b.sub.repoId);
+				if (!own || body.version?.id !== own.id) throw new Refused("the version isn't this repository's listing");
+				if (body.version?.url !== b.sub.assetUrl) throw new Refused("the version isn't this release's jar");
 				const added = lib.transaction(() => acceptVersion(lib, config.rootKeys, body.version, t));
-				const id = String(body.version?.id);
-				if (icon) lib.putIcon(id, icon);
+				if (icon && added.added) lib.putIcon(own.id, icon);
 				lib.updateSubmission(b.sub.id, { status: "signed", reason: null, report: stored }, t);
 				check(b.sub.id, { status: "completed", conclusion: "success", title: "Listed", summary: `Version ${shown(body.version?.version, 64)} is in the Myriad Library.` });
 				if (added.added) changed();
@@ -369,7 +395,9 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 					case "revocations": acceptRevocations(lib, config.rootKeys, body.doc); break;
 					case "listing": {
 						const repo = lib.repo(Number(body.doc?.repoId));
-						checkId(body.doc?.id, repo?.ownerId === config.myriadOwnerId && config.myriadOwnerId > 0);
+						const ours = repo?.ownerId === config.myriadOwnerId && config.myriadOwnerId > 0;
+						checkId(body.doc?.id, ours);
+						for (const p of Array.isArray(body.doc?.provides) ? body.doc.provides : []) checkId(p, ours);
 						const l = acceptListing(lib, config.rootKeys, body.doc, t);
 						const icon = sub && typeof (sub.report as any)?.icon === "string" ? iconOf((sub.report as any).icon) : undefined;
 						if (icon) lib.putIcon(l.id, icon);
@@ -387,21 +415,6 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		if (sub && (body.kind === "version" || body.kind === "listing") && !["signed", "rejected"].includes(sub.status)) {
 			lib.updateSubmission(sub.id, { status: "signed", reason: null }, t);
 			check(sub.id, { status: "completed", conclusion: "success", title: "Listed", summary: "Approved into the Myriad Library." });
-		}
-		changed();
-		return c.json({ ok: true });
-	});
-
-	app.post("/v1/library/yank", async c => {
-		const no = adminOnly(c);
-		if (no) return no;
-		if (!indexKey) return c.json({ error: "The Library isn't set up" }, 503);
-		const body = await jsonBody(c);
-		try {
-			yankWithIndexKey(lib, indexKey, String(body?.id), String(body?.version), now());
-		} catch (e) {
-			if (e instanceof Refused || e instanceof InvalidStatement) return c.json({ error: e.message }, 422);
-			throw e;
 		}
 		changed();
 		return c.json({ ok: true });
@@ -436,6 +449,9 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		if (!sub) return;
 		if (kind === "dispatch") {
 			if (sub.status !== "queued") return;
+			const since = now() - 6 * HOUR;
+			const repo = lib.repo(sub.repoId);
+			if (lib.activeBuilds(since) >= MAX_BUILDS || (repo && lib.activeBuilds(since, repo.installationId) >= MAX_BUILDS_EACH)) throw new Busy();
 			await github.dispatch(sub.builder === "open" ? config.builderOpenRepo : config.builderClosedRepo, sub.id);
 			lib.updateSubmission(sub.id, { dispatchedAt: now() }, now());
 		} else if (kind === "check-run") {
@@ -462,6 +478,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 					await runJob(job.kind, job.payload);
 					lib.finishJob(job.id);
 				} catch (e) {
+					if (e instanceof Busy) continue; // waits for a free builder, without counting as a failure
 					const giveUp = job.attempts + 1 >= 6;
 					lib.retryJob(job.id, e instanceof Error ? e.message : String(e), now() + 2 ** job.attempts * MINUTE, giveUp);
 					if (giveUp) console.error(`library job ${job.kind} gave up`, e);

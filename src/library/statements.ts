@@ -144,6 +144,16 @@ export function yankBytes(y: Yank): Buffer {
 	return ascii(`myriad-library-yank:1\nid=${y.id}\nversion=${y.version}\nsha256=${y.sha256}\n`);
 }
 
+/** The findings the maintainer accepted for one listing revision; only the builder reads it. */
+export function acceptedBytes(id: string, revision: number, findings: string[]): Buffer {
+	check(ID.test(id), "not a mod id");
+	positive(revision, "revision");
+	const sorted = [...new Set(findings)].sort();
+	check(sorted.length <= 200, "too many accepted findings");
+	for (const f of sorted) check(/^[!-<>-~]{1,300}$/.test(f), "not a finding");
+	return ascii(`myriad-library-accepted:1\nid=${id}\nrevision=${revision}\n${sorted.map(f => `finding=${f}\n`).join("")}`);
+}
+
 export function snapshotBytes(s: Snapshot): Buffer {
 	positive(s.issued, "issued");
 	check(positive(s.expires, "expires") > s.issued, "expires comes after issued");

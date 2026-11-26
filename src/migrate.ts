@@ -122,6 +122,8 @@ const STEPS: string[] = [
 		text   TEXT NOT NULL,
 		etag   TEXT NOT NULL
 	)`,
+	// 3: the listing key's signature over each listing's accepted findings (the builder trusts only signed ones).
+	`ALTER TABLE library_listings ADD COLUMN accepted_sigs TEXT NOT NULL DEFAULT '[]'`,
 ];
 
 export const SCHEMA_VERSION = STEPS.length;
