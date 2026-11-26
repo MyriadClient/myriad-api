@@ -29,7 +29,7 @@ export interface Config {
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
 	return {
 		port: int(env.PORT, 3000),
-		dbPath: env.DB_PATH ?? "data/myriad.db",
+		dbPath: env.DB_PATH?.trim() || "data/myriad.db",
 		siteUrl: (env.SITE_URL ?? "https://myriadclient.dev").replace(/\/$/, ""),
 		maxShareBytes: int(env.MAX_SHARE_BYTES, 256 * 1024),
 		uploadsPerHour: int(env.UPLOADS_PER_HOUR, 10),

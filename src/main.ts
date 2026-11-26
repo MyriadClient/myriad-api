@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { createApp } from "./app.ts";
 import { configFromEnv } from "./config.ts";
 import { Store } from "./db.ts";
@@ -8,6 +9,13 @@ import { RealGitHub } from "./library/github.ts";
 import { createLibrary } from "./library/library.ts";
 
 const config = configFromEnv();
+// A volume for the database is mounted at /data, but the database would live elsewhere (in the container, lost on every
+// deploy): refuse to start rather than lose what's stored. Seen when the host built the image without the Dockerfile.
+const persistent = "/data";
+if (config.dbPath !== ":memory:" && existsSync(persistent) && !resolve(config.dbPath).startsWith(persistent + "/")) {
+	console.error(`myriad-api: the database would be ${resolve(config.dbPath)}, outside the ${persistent} volume, and lost on the next deploy. Set DB_PATH=${persistent}/myriad.db (the Dockerfile does).`);
+	process.exit(1);
+}
 const store = new Store(config.dbPath);
 const libraryConfig = libraryConfigFromEnv();
 const library = createLibrary(store.db, libraryConfig, libraryConfig.github && new RealGitHub(libraryConfig.github), config.trustedProxies);
