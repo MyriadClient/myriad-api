@@ -2,7 +2,7 @@ import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
-import { clientKey } from "./address.ts";
+import { clientKey, forwardedShape } from "./address.ts";
 import { CODE, hashKey, keyMatches, newCode, newDeleteKey } from "./codes.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
@@ -55,6 +55,15 @@ export function createApp(store: Store, config: Config, now: () => number = Date
 	app.notFound(c => c.json({ error: "Not found" }, 404));
 
 	const who = (c: Context) => clientKey(c.req.header("x-forwarded-for"), socketAddress(c), config.trustedProxies);
+	// Once after start, the proxy chain's shape (no addresses): shows a deploy keys clients the way clientKey expects.
+	let shapeLogged = false;
+	app.use("/v1/*", async (c, next) => {
+		if (!shapeLogged) {
+			shapeLogged = true;
+			console.log(`First request's proxy chain (TRUSTED_PROXIES=${config.trustedProxies}): ${forwardedShape(c.req.header("x-forwarded-for"), socketAddress(c))}`);
+		}
+		await next();
+	});
 
 	app.get("/health", c => c.json({ ok: true }));
 

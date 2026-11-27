@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clientKey } from "../src/address.ts";
+import { clientKey, forwardedShape } from "../src/address.ts";
 import { createApp } from "../src/app.ts";
 import type { Config } from "../src/config.ts";
 import { Store } from "../src/db.ts";
@@ -12,7 +12,7 @@ const base: Config = {
 };
 
 function setup(overrides: Partial<Config> = {}) {
-	return createApp(new Store(":memory:"), { ...base, ...overrides });
+	return behindProxy(createApp(new Store(":memory:"), { ...base, ...overrides }));
 }
 
 const share = {
@@ -129,12 +129,28 @@ test("limits shares per client, and a forged X-Forwarded-For doesn't help", asyn
 	assert.equal((await publish(app, share, "9.9.9.9")).status, 201);
 });
 
+const PROXY = "172.18.0.2";
+
 test("an IPv6 client is its /64", () => {
-	assert.equal(clientKey("2001:db8:1:2:aaaa::1", undefined, 1), clientKey("2001:db8:1:2:ffff:1:2:3", undefined, 1));
-	assert.notEqual(clientKey("2001:db8:1:2::1", undefined, 1), clientKey("2001:db8:1:3::1", undefined, 1));
-	assert.equal(clientKey("::ffff:1.2.3.4", undefined, 1), "1.2.3.4");
+	assert.equal(clientKey("2001:db8:1:2:aaaa::1", PROXY, 1), clientKey("2001:db8:1:2:ffff:1:2:3", PROXY, 1));
+	assert.notEqual(clientKey("2001:db8:1:2::1", PROXY, 1), clientKey("2001:db8:1:3::1", PROXY, 1));
+	assert.equal(clientKey("::ffff:1.2.3.4", PROXY, 1), "1.2.3.4");
 	assert.equal(clientKey(undefined, "1.2.3.4", 0), "1.2.3.4");
-	assert.equal(clientKey("not-an-ip", undefined, 1), "invalid");
+	assert.equal(clientKey("not-an-ip", PROXY, 1), "invalid");
+});
+
+test("X-Forwarded-For counts only when it came through our own proxies", () => {
+	// Through the tunnel: Cloudflare names the client, cloudflared (own network) is appended by the front proxy.
+	assert.equal(clientKey("6.6.6.6, 5.6.7.8, 172.18.0.9", PROXY, 2), "5.6.7.8");
+	// Straight at the front proxy from the internet (a port forward): its real address is last; what it wrote is ignored.
+	assert.equal(clientKey("5.6.7.8, 9.9.9.9", PROXY, 2), "9.9.9.9");
+	assert.equal(clientKey("1.1.1.1, 2.2.2.2, 9.9.9.9", PROXY, 3), "9.9.9.9");
+	// Straight at the API (no proxy in front): the header is the sender's own words.
+	assert.equal(clientKey("5.6.7.8", "9.9.9.9", 1), "9.9.9.9");
+	assert.equal(clientKey("5.6.7.8", undefined, 1), "unknown");
+	// A chain shorter than expected keys by its first entry, never past the left end.
+	assert.equal(clientKey("172.18.0.9", PROXY, 3), "172.18.0.9");
+	assert.equal(forwardedShape("5.6.7.8, 172.18.0.9", PROXY), "socket own; forwarded [internet, own]");
 });
 
 test("guessing codes is cut off", async () => {
@@ -157,3 +173,10 @@ test("security headers on every response", async () => {
 	assert.match(res.headers.get("content-security-policy") ?? "", /default-src 'none'/);
 	assert.equal((await app.request("/nope")).status, 404);
 });
+
+/** Requests as the front proxy (on our own network) hands them on; tests without it reached the API directly. */
+function behindProxy<T extends { request: (...a: any[]) => any }>(app: T): T {
+	const request = app.request.bind(app);
+	app.request = ((input: any, init?: any, env?: any, ctx?: any) => request(input, init, env ?? { incoming: { socket: { remoteAddress: "172.18.0.2" } } }, ctx)) as T["request"];
+	return app;
+}
