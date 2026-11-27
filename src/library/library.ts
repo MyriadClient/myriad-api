@@ -186,7 +186,9 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 				addRepo(r, installation, Number(r.owner?.id), t);
 				lib.setRepoName(id, String(r.full_name), t);
 				if (lib.listingForRepo(id)) changed();
-			} else if (["transferred", "privatized", "deleted"].includes(p.action)) {
+			} else if (["transferred", "privatized", "publicized", "deleted"].includes(p.action)) {
+				// Publicized pauses too: an invite-only listing's private releases repository made public is no longer what
+				// was approved (its jars are anyone's now), and a closed listing's source going public wants a fresh look.
 				if (p.action === "deleted") lib.removeRepo(id, t);
 				else addRepo(r, installation, Number(r.owner?.id), t);
 				pause(id);

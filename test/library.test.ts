@@ -51,8 +51,11 @@ class FakeGitHub implements GitHub {
 	}
 	asset: Buffer = Buffer.alloc(0);
 	assets: { installation: number; repoId: number; repo: string; assetId: number }[] = [];
+	/** When set, downloads wait for it (to have several in flight at once). */
+	assetGate?: Promise<void>;
 	async assetBytes(installation: number, repoId: number, repo: string, assetId: number) {
 		this.assets.push({ installation, repoId, repo, assetId });
+		if (this.assetGate) await this.assetGate;
 		return this.asset;
 	}
 }
@@ -634,4 +637,65 @@ test("an expired or revoked invite doesn't work", async () => {
 	advance(2 * 60_000);
 	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: a }, token)).status, 404, "expired");
 	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: b }, token)).status, 404, "revoked");
+});
+
+test("parallel downloads can't slip past the daily cap, and signing in again buys no more", async () => {
+	const { app, library, mojang, github, now } = setup();
+	const jar = Buffer.alloc(1000, 7);
+	github.asset = jar;
+	await inviteOnly(app, library, jar);
+	const token = await signIn(app, mojang);
+	const code = `myr-${"F".repeat(27)}`;
+	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(code)!), uses: 1, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code }, token)).status, 200);
+
+	// Fifteen at once while GitHub is slow: one is fetched, the rest are turned away.
+	let open!: () => void;
+	github.assetGate = new Promise(r => open = r);
+	const burst = Array.from({ length: 15 }, () => req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token));
+	await new Promise(r => setTimeout(r, 20));
+	open();
+	const codes = (await Promise.all(burst)).map(r => r.status);
+	assert.equal(codes.filter(c => c === 200).length, 1, codes.join(","));
+	github.assetGate = undefined;
+
+	// One at a time, ten a day per version, whichever session asks.
+	for (let i = 1; i < 10; i++) assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 200);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 429);
+	const again = await signIn(app, mojang);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, again)).status, 429, "a new session is the same player");
+
+	// Only what reached the player is counted: the turned-away requests in the burst aren't.
+	assert.equal((library.store.db.prepare("SELECT COUNT(*) AS n FROM library_downloads").get() as { n: number }).n, 10);
+});
+
+test("a private releases repository made public pauses its listing", async () => {
+	const { app, library } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	assert.equal((await req(app, "GET", "/v1/library/addons/closed-addon")).status, 200);
+	await hook(app, "repository", { action: "publicized", installation: { id: 5 }, repository: { id: 103, full_name: "dev/secret-releases", private: false, owner: { id: 200 } } });
+	assert.equal((await req(app, "GET", "/v1/library/addons/closed-addon")).status, 404);
+});
+
+test("developers can still revoke while their listing is paused", async () => {
+	const { app, library, mojang, now } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	const token = await signIn(app, mojang);
+	const code = `myr-${"G".repeat(27)}`;
+	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(code)!), uses: 1, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code }, token)).status, 200);
+	assert.equal((await req(app, "POST", "/v1/library/listings/closed-addon/pause", undefined, ADMIN)).status, 200);
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "revoke-grant", uuid: PLAYER.id }, now()))).status, 200);
+	assert.equal(library.store.db.prepare("SELECT revoked FROM library_grants").get()!.revoked, 1);
+});
+
+test("a session ends 90 days after it was made, however much it's used", async () => {
+	const { app, mojang, advance } = setup();
+	const token = await signIn(app, mojang);
+	for (let day = 0; day < 87; day += 2) {
+		advance(2 * 24 * 3600_000);
+		assert.equal((await req(app, "GET", "/v1/auth/session", undefined, token)).status, 200, `day ${day + 2}`);
+	}
+	advance(3 * 24 * 3600_000);
+	assert.equal((await req(app, "GET", "/v1/auth/session", undefined, token)).status, 401);
 });

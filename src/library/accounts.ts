@@ -25,6 +25,10 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 const NONCE_LIFE = 2 * MINUTE;
 const SESSION_LIFE = 30 * DAY;
+/** However much it's used, a session ends this long after it was made: signing in again proves the account afresh. */
+const SESSION_MAX = 90 * DAY;
+/** Private downloads fetched from GitHub at once, over everyone (each holds a jar in memory). */
+const MAX_FETCHES = 4;
 /** A developer's signed request counts only this close to the API's clock, and only once. */
 const REQUEST_WINDOW = 5 * MINUTE;
 const SESSION = /^Bearer (myr_s_[A-Za-z0-9_-]{43})$/;
@@ -100,9 +104,12 @@ export class AccountStore {
 
 	/** The session a token is, if it's live; each use keeps it alive for another 30 days (written at most hourly). */
 	session(tokenHash: string, now: number): Session | undefined {
-		const r = this.db.prepare("SELECT id, uuid, name, last_used, expires FROM auth_sessions WHERE token_hash = ?").get(tokenHash) as Row | undefined;
+		const r = this.db.prepare("SELECT id, uuid, name, created, last_used, expires FROM auth_sessions WHERE token_hash = ?").get(tokenHash) as Row | undefined;
 		if (!r || Number(r.expires) <= now) return undefined;
-		if (now - Number(r.last_used) > HOUR) this.db.prepare("UPDATE auth_sessions SET last_used = ?, expires = ? WHERE id = ?").run(now, now + SESSION_LIFE, r.id as number);
+		if (now - Number(r.last_used) > HOUR) {
+			const expires = Math.min(now + SESSION_LIFE, Number(r.created) + SESSION_MAX);
+			this.db.prepare("UPDATE auth_sessions SET last_used = ?, expires = ? WHERE id = ?").run(now, expires, r.id as number);
+		}
 		return { id: Number(r.id), uuid: String(r.uuid), name: String(r.name) };
 	}
 
@@ -194,8 +201,14 @@ export class AccountStore {
 			.get(listingId, uuid, version, since) as Row).n);
 	}
 
-	noteDownload(listingId: string, uuid: string, version: string, now: number): void {
-		this.db.prepare("INSERT INTO library_downloads (listing_id, uuid, version, at) VALUES (?, ?, ?, ?)").run(listingId, uuid, version, now);
+	/** Counts a download (before it's fetched, so requests in flight count too); answers its row, to take back if it fails. */
+	noteDownload(listingId: string, uuid: string, version: string, now: number): number {
+		return Number(this.db.prepare("INSERT INTO library_downloads (listing_id, uuid, version, at) VALUES (?, ?, ?, ?)").run(listingId, uuid, version, now).lastInsertRowid);
+	}
+
+	/** Takes back a counted download that never reached the player. */
+	unnoteDownload(row: number): void {
+		this.db.prepare("DELETE FROM library_downloads WHERE rowid = ?").run(row);
 	}
 
 	forgetOld(now: number): void {
@@ -251,6 +264,16 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 		const l = lib.listing(id);
 		return l && l.access === "invite" && listingLive(lib, l) ? l : undefined;
 	};
+	/**
+	 * An invite-only listing its developer may manage, live or paused: revoking someone must work while the listing is
+	 * paused, so they're out before it's back. (Redeeming and downloading still need it live.)
+	 */
+	const managedListing = (id: string) => {
+		const l = lib.listing(id);
+		return l && l.access === "invite" ? l : undefined;
+	};
+	/** Players fetching a private download now, and how many fetches run over everyone. */
+	const fetching = new Set<string>();
 
 	// ---- linking a Minecraft account -------------------------------------------------------------------------------
 
@@ -333,7 +356,7 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 		} catch (e) {
 			return c.json({ error: e instanceof InvalidStatement ? e.message : "Not an invite request" }, 400);
 		}
-		const listing = inviteListing(req.id);
+		const listing = managedListing(req.id);
 		if (!listing) return c.json({ error: "No invite-only listing with that id" }, 404);
 		let signed;
 		try {
@@ -390,24 +413,35 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 	app.get("/v1/library/private/:id/:version", async c => {
 		const s = sessionOf(c);
 		if (!s) return c.json({ error: "Not signed in" }, 401);
-		if (!downloads.tryHit(String(s.id), now())) return tooMany(c);
+		// Per player, not per session: signing in again doesn't buy more.
+		if (!downloads.tryHit(s.uuid, now())) return tooMany(c);
 		const listing = inviteListing(c.req.param("id"));
 		if (!listing || !store.hasGrant(listing.id, s.uuid)) return c.json({ error: "No access to that addon" }, 403);
 		const v = lib.version(listing.id, c.req.param("version"));
 		const yanked = v && lib.yanks(listing.id).some(y => y.version === v.version && y.sha256 === v.sha256);
 		if (!v || yanked || !v.assetId) return c.json({ error: "No such release" }, 404);
-		if (store.downloadsSince(listing.id, s.uuid, v.version, now() - DAY) >= 10) return tooMany(c);
 		const repo = lib.repo(listing.downloadRepoId);
 		if (!repo || repo.removed || !github) return c.json({ error: "Its releases can't be reached" }, 503);
+		// One fetch at a time per player, a few over everyone, and counted before it starts, so parallel requests can't
+		// slip past the daily cap while GitHub answers.
+		if (fetching.has(s.uuid) || fetching.size >= MAX_FETCHES) return tooMany(c);
+		if (store.downloadsSince(listing.id, s.uuid, v.version, now() - DAY) >= 10) return tooMany(c);
+		const counted = store.noteDownload(listing.id, s.uuid, v.version, now());
+		fetching.add(s.uuid);
 		let jar: Buffer;
 		try {
 			jar = await github.assetBytes(repo.installationId, repo.id, repo.fullName, v.assetId, Math.min(MAX_JAR, v.size));
 		} catch {
+			store.unnoteDownload(counted);
 			return c.json({ error: "Its release couldn't be fetched; try again later" }, 502);
+		} finally {
+			fetching.delete(s.uuid);
 		}
 		// Exactly the jar the listing key signed, or nothing (the game checks it again).
-		if (jar.length !== v.size || sha256(jar) !== v.sha256) return c.json({ error: "Its release isn't the jar the Library lists" }, 502);
-		store.noteDownload(listing.id, s.uuid, v.version, now());
+		if (jar.length !== v.size || sha256(jar) !== v.sha256) {
+			store.unnoteDownload(counted);
+			return c.json({ error: "Its release isn't the jar the Library lists" }, 502);
+		}
 		return c.body(new Uint8Array(jar), 200, { "Content-Type": "application/java-archive", "Cache-Control": "no-store", "Content-Length": String(jar.length) });
 	});
 
