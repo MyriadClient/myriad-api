@@ -58,7 +58,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 	const app = new Hono();
 	const reads = new RateLimit(120, MINUTE);
 	const writes = new RateLimit(60, MINUTE);
-	const who = (c: Context) => clientKey(c.req.header("x-forwarded-for"), socketAddress(c), trustedProxies);
+	const who = (c: Context) => clientKey(c.req.header("x-forwarded-for"), socketAddress(c), trustedProxies, c.req.header("cf-connecting-ip"));
 
 	// Each rebuild moves `issued` on by at least a second. However many changes arrive, it never gets more than a minute
 	// ahead of the clock (clients refuse an index from more than a day ahead): past that, rebuilds wait.

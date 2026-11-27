@@ -150,7 +150,21 @@ test("X-Forwarded-For counts only when it came through our own proxies", () => {
 	assert.equal(clientKey("5.6.7.8", undefined, 1), "unknown");
 	// A chain shorter than expected keys by its first entry, never past the left end.
 	assert.equal(clientKey("172.18.0.9", PROXY, 3), "172.18.0.9");
-	assert.equal(forwardedShape("5.6.7.8, 172.18.0.9", PROXY), "socket own; forwarded [internet, own]");
+	assert.equal(forwardedShape("5.6.7.8, 172.18.0.9", PROXY), "socket own; forwarded [internet, own]; cf-connecting-ip absent");
+	assert.equal(forwardedShape("172.18.0.9", PROXY, "5.6.7.8"), "socket own; forwarded [own]; cf-connecting-ip internet");
+});
+
+test("Cloudflare's visitor address counts only when the request came through our own network all the way", () => {
+	// Live: the front proxy replaces X-Forwarded-For with the tunnel's address; Cloudflare names the visitor.
+	assert.equal(clientKey("172.18.0.9", PROXY, 2, "5.6.7.8"), "5.6.7.8");
+	assert.notEqual(clientKey("172.18.0.9", PROXY, 2, "5.6.7.8"), clientKey("172.18.0.9", PROXY, 2, "9.9.9.9"), "two visitors, two buckets");
+	assert.equal(clientKey("172.18.0.9", PROXY, 2, "2001:db8:1:2::1"), "2001:0db8:0001:0002::/64");
+	// Around the tunnel, straight at the front proxy: its real address is a hop, and a forged header is ignored.
+	assert.equal(clientKey("9.9.9.9", PROXY, 2, "1.2.3.4"), "9.9.9.9");
+	// Straight at the API: neither header counts.
+	assert.equal(clientKey("172.18.0.9", "9.9.9.9", 2, "1.2.3.4"), "9.9.9.9");
+	// A header that isn't an address is ignored.
+	assert.equal(clientKey("172.18.0.9", PROXY, 2, "not-an-ip"), "172.18.0.9");
 });
 
 test("guessing codes is cut off", async () => {

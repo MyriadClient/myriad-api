@@ -38,9 +38,14 @@ export function ownNetwork(address: string | undefined): boolean {
  *
  * An IPv6 client is its /64 (one household or server can rotate through a whole /64).
  */
-export function clientKey(forwardedFor: string | undefined, socketAddress: string | undefined, trustedProxies: number): string {
+export function clientKey(forwardedFor: string | undefined, socketAddress: string | undefined, trustedProxies: number, edgeClient?: string): string {
 	if (trustedProxies <= 0 || !ownNetwork(socketAddress)) return keyOf(socketAddress);
 	const hops = (forwardedFor ?? "").split(",").map(s => s.trim()).filter(Boolean);
+	// Cloudflare names the visitor in CF-Connecting-IP (the front proxy replaces X-Forwarded-For with the tunnel's own
+	// address). Believed only when every hop is our own network, i.e. it came through the tunnel: a request that reached
+	// the front proxy from the internet carries its real address as a hop and is keyed by that instead.
+	const edge = edgeClient?.trim();
+	if (edge && isIP(edge) && hops.every(ownNetwork)) return keyOf(edge);
 	if (hops.length === 0) return keyOf(socketAddress);
 	// hops[last] is who connected to the innermost proxy; step left only past addresses of our own proxies.
 	let i = hops.length - 1;
@@ -53,10 +58,10 @@ export function clientKey(forwardedFor: string | undefined, socketAddress: strin
  * on our own network. Logged once after start, so a deploy shows whether the proxies chain the way {@link clientKey}
  * expects.
  */
-export function forwardedShape(forwardedFor: string | undefined, socketAddress: string | undefined): string {
+export function forwardedShape(forwardedFor: string | undefined, socketAddress: string | undefined, edgeClient?: string): string {
 	const hops = (forwardedFor ?? "").split(",").map(s => s.trim()).filter(Boolean);
 	const kind = (a: string | undefined) => (ownNetwork(a) ? "own" : isIP(a ?? "") || /^::ffff:/i.test(a ?? "") ? "internet" : "invalid");
-	return `socket ${kind(socketAddress)}; forwarded [${hops.map(kind).join(", ")}]`;
+	return `socket ${kind(socketAddress)}; forwarded [${hops.map(kind).join(", ")}]; cf-connecting-ip ${edgeClient ? kind(edgeClient.trim()) : "absent"}`;
 }
 
 function keyOf(address: string | undefined): string {

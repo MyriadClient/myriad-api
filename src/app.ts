@@ -54,13 +54,13 @@ export function createApp(store: Store, config: Config, now: () => number = Date
 	});
 	app.notFound(c => c.json({ error: "Not found" }, 404));
 
-	const who = (c: Context) => clientKey(c.req.header("x-forwarded-for"), socketAddress(c), config.trustedProxies);
+	const who = (c: Context) => clientKey(c.req.header("x-forwarded-for"), socketAddress(c), config.trustedProxies, c.req.header("cf-connecting-ip"));
 	// Once after start, the proxy chain's shape (no addresses): shows a deploy keys clients the way clientKey expects.
 	let shapeLogged = false;
 	app.use("/v1/*", async (c, next) => {
 		if (!shapeLogged) {
 			shapeLogged = true;
-			console.log(`First request's proxy chain (TRUSTED_PROXIES=${config.trustedProxies}): ${forwardedShape(c.req.header("x-forwarded-for"), socketAddress(c))}`);
+			console.log(`First request's proxy chain (TRUSTED_PROXIES=${config.trustedProxies}): ${forwardedShape(c.req.header("x-forwarded-for"), socketAddress(c), c.req.header("cf-connecting-ip"))}`);
 		}
 		await next();
 	});
