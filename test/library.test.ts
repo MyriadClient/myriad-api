@@ -241,7 +241,7 @@ test("a release becomes a build; the open builder signs it in; the developer see
 	assert.equal((await hook(app, "release", released(100, "dev/good-addon", "v1.1.0"))).status, 202);
 	await library.tick();
 	assert.deepEqual(github.dispatched, [{ repo: "MyriadClient/myriad-builder", submission: 1 }], "one build for one release");
-	assert.equal(github.checks[0]?.run.title, "Queued");
+	assert.match(github.checks[0]?.run.title ?? "", /^Queued/);
 
 	assert.equal((await req(app, "GET", "/v1/library/builds/1")).status, 403);
 	assert.equal((await req(app, "GET", "/v1/library/builds/1", undefined, CLOSED)).status, 404, "the closed builder can't see an open build");

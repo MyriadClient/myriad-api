@@ -9,6 +9,7 @@ import { type CheckRun, type GitHub, webhookSignatureValid } from "./github.ts";
 import {
 	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, detailsText, downloadable, listingLive, Refused, shown, versionInfo,
 } from "./rules.ts";
+import { approvedCheck, buildingCheck, listedCheck, queuedCheck, refusedCheck, reviewCheck } from "./checks.ts";
 import { InvalidStatement, privateKey } from "./statements.ts";
 import { type Builder, LibraryStore, type ListingRow, type SubmissionRow } from "./store.ts";
 
@@ -236,9 +237,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 			.find((u: string) => downloadable(u) && !/-(sources|javadoc)\.jar$/.test(u));
 		const id = lib.addSubmission(repoId, String(rel.tag_name), asset ?? null, builder, status, t);
 		if (id === undefined) return;
-		check(id, status === "waiting"
-			? { status: "queued", title: "Waiting for Myriad", summary: "Closed-source addons are built once the Myriad maintainer accepts them." }
-			: { status: "queued", title: "Queued", summary: "Waiting for Myriad's builder." });
+		check(id, queuedCheck(String(rel.tag_name), builder === "closed", status === "waiting"));
 		if (status === "queued") lib.addJob("dispatch", { submission: id }, t);
 	}
 
@@ -283,7 +282,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		const b = buildFor(c);
 		if (b instanceof Response) return b;
 		lib.updateSubmission(b.sub.id, { status: "building" }, now());
-		check(b.sub.id, { status: "in_progress", title: "Building", summary: "Myriad's builder is building and checking this release." });
+		check(b.sub.id, buildingCheck(b.sub.tag, b.builder === "closed"));
 		return c.json({ ok: true });
 	});
 
@@ -325,24 +324,24 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 				});
 				if (icon && added.added) lib.putIcon(own.id, icon);
 				lib.updateSubmission(b.sub.id, { status: "signed", reason: null, report: stored }, t);
-				check(b.sub.id, { status: "completed", conclusion: "success", title: "Listed", summary: `Version ${shown(body.version?.version, 64)} is in the Myriad Library.` });
+				check(b.sub.id, listedCheck(b.sub.tag, own.id, shown(body.version?.version, 64), stored, (b.builder === "open" ? runOf(report) : undefined)));
 				if (added.added) changed();
 				return c.json({ ok: true });
 			} catch (e) {
 				const why = e instanceof Refused || e instanceof InvalidStatement ? e.message : "it couldn't be checked";
 				lib.updateSubmission(b.sub.id, { status: "failed", reason: `Refused: ${why}`, report: stored }, t);
-				check(b.sub.id, { status: "completed", conclusion: "failure", title: "Not listed", summary: `Refused: ${why}` });
+				check(b.sub.id, refusedCheck(b.sub.tag, `Refused: ${why}`, stored, "listed", (b.builder === "open" ? runOf(report) : undefined)));
 				return c.json({ error: why }, 422);
 			}
 		}
 		if (body.outcome === "review") {
 			lib.updateSubmission(b.sub.id, { status: "review", reason: shown(body.reason, 500) || null, report: stored }, t);
-			check(b.sub.id, { status: "completed", conclusion: "neutral", title: "Waiting for review", summary: shown(body.reason, 500) || "The Myriad maintainer will look at this release." });
+			check(b.sub.id, reviewCheck(b.sub.tag, shown(body.reason, 2000), stored, (b.builder === "open" ? runOf(report) : undefined)));
 			return c.json({ ok: true });
 		}
 		const reason = shown(body.reason, 500) || "The build failed.";
 		lib.updateSubmission(b.sub.id, { status: "failed", reason, report: stored }, t);
-		check(b.sub.id, { status: "completed", conclusion: "failure", title: "Not listed", summary: reason });
+		check(b.sub.id, refusedCheck(b.sub.tag, reason, stored, Object.keys(report).length ? "checks" : "build", (b.builder === "open" ? runOf(report) : undefined)));
 		return c.json({ ok: true });
 	});
 
@@ -374,7 +373,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		if (!sub || sub.status !== "waiting") return c.json({ error: "Nothing waiting with that id" }, 404);
 		lib.updateSubmission(sub.id, { status: "queued" }, now());
 		lib.addJob("dispatch", { submission: sub.id }, now());
-		check(sub.id, { status: "queued", title: "Queued", summary: "Accepted; waiting for Myriad's builder." });
+		check(sub.id, queuedCheck(sub.tag, true, false));
 		return c.json({ ok: true });
 	});
 
@@ -386,7 +385,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		if (!sub || ["signed", "rejected"].includes(sub.status)) return c.json({ error: "No open submission with that id" }, 404);
 		const reason = shown(body?.reason, 500) || "Not accepted into the Myriad Library.";
 		lib.updateSubmission(sub.id, { status: "rejected", reason }, now());
-		check(sub.id, { status: "completed", conclusion: "failure", title: "Not listed", summary: reason });
+		check(sub.id, refusedCheck(sub.tag, reason, sub.report as Record<string, unknown> | null, "review"));
 		return c.json({ ok: true });
 	});
 
@@ -437,7 +436,9 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		}
 		if (sub && (body.kind === "version" || body.kind === "listing") && !["signed", "rejected"].includes(sub.status)) {
 			lib.updateSubmission(sub.id, { status: "signed", reason: null }, t);
-			check(sub.id, { status: "completed", conclusion: "success", title: "Listed", summary: "Approved into the Myriad Library." });
+			check(sub.id, body.kind === "version" && typeof body.doc?.id === "string"
+				? listedCheck(sub.tag, body.doc.id, shown(body.doc.version, 64), sub.report as Record<string, unknown> | null, sub.builder === "open" ? runOf(sub.report) : undefined)
+				: approvedCheck(sub.tag));
 		}
 		changed();
 		return c.json({ ok: true });
@@ -539,6 +540,12 @@ function summary(lib: LibraryStore, l: ListingRow) {
 		changelog: latest?.changelog ? { version: latest.version, text: latest.changelog } : null,
 		updated: new Date(l.updatedAt).toISOString(),
 	};
+}
+
+/** The builder's GitHub Actions run, from its report, for a link (only digits pass). */
+function runOf(report: unknown): string | undefined {
+	const r = report && typeof report === "object" ? (report as Record<string, unknown>).run : undefined;
+	return typeof r === "string" && /^\d{1,20}$/.test(r) ? r : undefined;
 }
 
 function signedListing(l: ListingRow) {

@@ -17,6 +17,8 @@ export interface CheckRun {
 	conclusion?: "success" | "failure" | "neutral" | "action_required" | "cancelled";
 	title: string;
 	summary: string;
+	/** Longer details under the summary (GitHub shows them below it). */
+	text?: string;
 }
 
 export const CHECK_NAME = "Myriad Library";
@@ -118,6 +120,6 @@ function checkBody(run: CheckRun) {
 	return {
 		status: run.status,
 		...(run.status === "completed" ? { conclusion: run.conclusion ?? "neutral" } : {}),
-		output: { title: run.title.slice(0, 200), summary: run.summary.slice(0, 4000) },
+		output: { title: run.title.slice(0, 200), summary: run.summary.slice(0, 65000), ...(run.text ? { text: run.text.slice(0, 65000) } : {}) },
 	};
 }
