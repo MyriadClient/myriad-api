@@ -14,6 +14,8 @@ export interface ListingRow extends Listing {
 	acceptedSigs: Sig[];
 	paused: boolean;
 	updatedAt: number;
+	/** "invite": its jars come from a private releases repository and go only to accounts with a grant. */
+	access: "public" | "invite";
 }
 
 export interface VersionRow {
@@ -30,6 +32,8 @@ export interface VersionRow {
 	/** Display only, from the builder's report: what the version adds, and what changed in it. */
 	modules?: ModuleInfo[];
 	changelog?: string | null;
+	/** The GitHub release asset the jar is (needed to fetch it from a private repository). */
+	assetId?: number | null;
 }
 
 export interface ModuleInfo {
@@ -63,6 +67,7 @@ export interface SubmissionRow {
 	tokenIssued: boolean;
 	createdAt: number;
 	updatedAt: number;
+	assetId: number | null;
 }
 
 export interface RepoRow {
@@ -172,14 +177,14 @@ export class LibraryStore {
 	// ---- listings ---------------------------------------------------------------------------------------------------
 
 	putListing(l: Omit<ListingRow, "paused" | "updatedAt">, now: number): void {
-		this.db.prepare(`INSERT INTO library_listings (id, revision, repo_id, owner_id, source, download_repo_id, build, provides, keys, sigs, name, description, author, repo_name, accepted, accepted_sigs, paused, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+		this.db.prepare(`INSERT INTO library_listings (id, revision, repo_id, owner_id, source, download_repo_id, build, provides, keys, sigs, name, description, author, repo_name, accepted, accepted_sigs, paused, updated_at, access)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, repo_id = excluded.repo_id, owner_id = excluded.owner_id, source = excluded.source,
 			download_repo_id = excluded.download_repo_id, build = excluded.build, provides = excluded.provides, keys = excluded.keys, sigs = excluded.sigs,
 			name = excluded.name, description = excluded.description, author = excluded.author, repo_name = excluded.repo_name, accepted = excluded.accepted,
-			accepted_sigs = excluded.accepted_sigs, paused = 0, updated_at = excluded.updated_at`)
+			accepted_sigs = excluded.accepted_sigs, paused = 0, updated_at = excluded.updated_at, access = excluded.access`)
 			.run(l.id, l.revision, l.repoId, l.ownerId, l.source, l.downloadRepoId, l.build, json(l.provides), json(l.keys), json(l.sigs),
-				l.name, l.description, l.author, l.repoName, json(l.accepted), json(l.acceptedSigs), now);
+				l.name, l.description, l.author, l.repoName, json(l.accepted), json(l.acceptedSigs), now, l.access);
 	}
 
 	listing(id: string): ListingRow | undefined {
@@ -223,6 +228,17 @@ export class LibraryStore {
 		return Number(r.changes) === 1;
 	}
 
+	/** Which GitHub release asset a version's jar is. */
+	setVersionAsset(listingId: string, version: string, assetId: number | null): void {
+		if (assetId === null) return;
+		this.db.prepare("UPDATE library_versions SET asset_id = ? WHERE listing_id = ? AND version = ?").run(assetId, listingId, version);
+	}
+
+	/** Makes a listing invite-only, or public again. */
+	setAccess(listingId: string, access: "public" | "invite"): void {
+		this.db.prepare("UPDATE library_listings SET access = ? WHERE id = ?").run(access, listingId);
+	}
+
 	/** Sets what Browse shows of a version (its modules and changelog), already cleaned. */
 	setVersionInfo(listingId: string, version: string, modules: ModuleInfo[], changelog: string | null): void {
 		this.db.prepare("UPDATE library_versions SET modules = ?, changelog = ? WHERE listing_id = ? AND version = ?").run(json(modules), changelog, listingId, version);
@@ -251,9 +267,9 @@ export class LibraryStore {
 	// ---- submissions ------------------------------------------------------------------------------------------------
 
 	/** A new submission for `tag` of `repoId`; undefined when that release was submitted before. */
-	addSubmission(repoId: number, tag: string, assetUrl: string | null, builder: Builder, status: SubmissionStatus, now: number): number | undefined {
-		const r = this.db.prepare(`INSERT OR IGNORE INTO library_submissions (repo_id, tag, asset_url, builder, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-			.run(repoId, tag, assetUrl, builder, status, now, now);
+	addSubmission(repoId: number, tag: string, assetUrl: string | null, builder: Builder, status: SubmissionStatus, now: number, assetId: number | null = null): number | undefined {
+		const r = this.db.prepare(`INSERT OR IGNORE INTO library_submissions (repo_id, tag, asset_url, builder, status, created_at, updated_at, asset_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+			.run(repoId, tag, assetUrl, builder, status, now, now, assetId);
 		return Number(r.changes) === 1 ? Number(r.lastInsertRowid) : undefined;
 	}
 
@@ -343,6 +359,7 @@ function listingOf(r: Row): ListingRow {
 		downloadRepoId: Number(r.download_repo_id), build: String(r.build), provides: parse<string[]>(r.provides), keys: parse<string[]>(r.keys),
 		sigs: parse<Sig[]>(r.sigs), name: String(r.name), description: String(r.description), author: String(r.author), repoName: String(r.repo_name),
 		accepted: parse<string[]>(r.accepted), acceptedSigs: parse<Sig[]>(r.accepted_sigs), paused: Number(r.paused) === 1, updatedAt: Number(r.updated_at),
+		access: r.access === "invite" ? "invite" : "public",
 	};
 }
 
@@ -352,6 +369,7 @@ function versionOf(r: Row): VersionRow {
 		url: String(r.url), minecraft: r.minecraft === null ? null : String(r.minecraft), sigs: parse<Sig[]>(r.sigs), developer: parse<Sig[]>(r.developer),
 		createdAt: Number(r.created_at), modules: r.modules === undefined || r.modules === null ? [] : parse<ModuleInfo[]>(r.modules),
 		changelog: r.changelog === undefined || r.changelog === null ? null : String(r.changelog),
+		assetId: r.asset_id === undefined || r.asset_id === null ? null : Number(r.asset_id),
 	};
 }
 
@@ -362,5 +380,6 @@ function submissionOf(r: Row): SubmissionRow {
 		report: r.report === null ? null : parse(r.report), checkRunId: r.check_run_id === null ? null : Number(r.check_run_id),
 		headSha: r.head_sha === null ? null : String(r.head_sha), dispatchedAt: r.dispatched_at === null ? null : Number(r.dispatched_at),
 		tokenIssued: Number(r.token_issued) === 1, createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+		assetId: r.asset_id === undefined || r.asset_id === null ? null : Number(r.asset_id),
 	};
 }

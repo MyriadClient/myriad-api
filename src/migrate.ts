@@ -127,6 +127,57 @@ const STEPS: string[] = [
 	// 4: what Browse shows of each version before it's installed: its modules and its changelog, from the builder's report.
 	`ALTER TABLE library_versions ADD COLUMN modules TEXT NOT NULL DEFAULT '[]';
 	ALTER TABLE library_versions ADD COLUMN changelog TEXT`,
+	// 5: invite-only listings (their jars from a private releases repository, handed out only to accounts with a grant),
+	// the release asset each version is, and players' accounts: linked Minecraft sessions, invites and grants.
+	`ALTER TABLE library_listings ADD COLUMN access TEXT NOT NULL DEFAULT 'public';
+	ALTER TABLE library_submissions ADD COLUMN asset_id INTEGER;
+	ALTER TABLE library_versions ADD COLUMN asset_id INTEGER;
+	CREATE TABLE auth_nonces (
+		nonce_hash TEXT PRIMARY KEY,
+		created    INTEGER NOT NULL
+	);
+	CREATE TABLE auth_sessions (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		token_hash TEXT NOT NULL UNIQUE,
+		uuid       TEXT NOT NULL,
+		name       TEXT NOT NULL,
+		label      TEXT NOT NULL,
+		created    INTEGER NOT NULL,
+		last_used  INTEGER NOT NULL,
+		expires    INTEGER NOT NULL
+	);
+	CREATE INDEX auth_sessions_uuid ON auth_sessions (uuid);
+	CREATE TABLE library_invites (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		listing_id TEXT NOT NULL,
+		code_hash  TEXT NOT NULL UNIQUE,
+		max_uses   INTEGER NOT NULL,
+		uses_left  INTEGER NOT NULL,
+		expires    INTEGER NOT NULL,
+		label      TEXT NOT NULL DEFAULT '',
+		created    INTEGER NOT NULL,
+		revoked    INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE TABLE library_grants (
+		listing_id TEXT NOT NULL,
+		uuid       TEXT NOT NULL,
+		name       TEXT NOT NULL,
+		invite_id  INTEGER,
+		created    INTEGER NOT NULL,
+		revoked    INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (listing_id, uuid)
+	);
+	CREATE TABLE library_requests (
+		nonce TEXT PRIMARY KEY,
+		seen  INTEGER NOT NULL
+	);
+	CREATE TABLE library_downloads (
+		listing_id TEXT NOT NULL,
+		uuid       TEXT NOT NULL,
+		version    TEXT NOT NULL,
+		at         INTEGER NOT NULL
+	);
+	CREATE INDEX library_downloads_who ON library_downloads (listing_id, uuid, at)`,
 ];
 
 export const SCHEMA_VERSION = STEPS.length;

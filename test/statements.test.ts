@@ -66,3 +66,11 @@ test("odd fields are refused", () => {
 	bad(() => keyCertBytes({ key: `${K}=`, role: "listing", notAfter: 0 }));
 	bad(() => snapshotBytes({ issued: 20, expires: 10, bodySha256: D }));
 });
+
+test("invite requests are spelled as the Gradle plugin spells them", async () => {
+	const { inviteBytes } = await import("../src/library/statements.ts");
+	assert.equal(inviteBytes({ id: "closed-addon", action: "create", api: "https://api.myriadclient.dev", issued: 1800000000, nonce: "nonce-00000000000000000000", codeSha256: "a".repeat(64), uses: 2, notAfter: 1800003600, label: "friends" }).toString("ascii"),
+		"myriad-library-invite:1\nid=closed-addon\naction=create\napi=https://api.myriadclient.dev\nissued=1800000000\nnonce=nonce-00000000000000000000\ncode-sha256=" + "a".repeat(64) + "\nuses=2\nnot-after=1800003600\nlabel=friends\n");
+	assert.equal(inviteBytes({ id: "closed-addon", action: "revoke-grant", api: "https://api.myriadclient.dev", issued: 1800000000, nonce: "nonce-00000000000000000001", uuid: "0123456789abcdef0123456789abcdef" }).toString("ascii"),
+		"myriad-library-invite:1\nid=closed-addon\naction=revoke-grant\napi=https://api.myriadclient.dev\nissued=1800000000\nnonce=nonce-00000000000000000001\nuuid=0123456789abcdef0123456789abcdef\n");
+});

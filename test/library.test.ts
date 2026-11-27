@@ -9,8 +9,9 @@ import { Store } from "../src/db.ts";
 import type { LibraryConfig } from "../src/library/config.ts";
 import type { CheckRun, GitHub } from "../src/library/github.ts";
 import { createLibrary } from "../src/library/library.ts";
+import { canonicalCode, type Mojang, serverIdFor } from "../src/library/accounts.ts";
 import {
-	acceptedBytes, keyCertBytes, listingBytes, privateKey, releaseBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes, type Listing,
+	acceptedBytes, inviteBytes, type InviteRequest, keyCertBytes, listingBytes, privateKey, releaseBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes, type Listing,
 } from "../src/library/statements.ts";
 import { hashKey } from "../src/codes.ts";
 import { migrate, SCHEMA_VERSION } from "../src/migrate.ts";
@@ -48,6 +49,23 @@ class FakeGitHub implements GitHub {
 	async dispatch(repo: string, submission: number) {
 		this.dispatched.push({ repo, submission });
 	}
+	asset: Buffer = Buffer.alloc(0);
+	assets: { installation: number; repoId: number; repo: string; assetId: number }[] = [];
+	async assetBytes(installation: number, repoId: number, repo: string, assetId: number) {
+		this.assets.push({ installation, repoId, repo, assetId });
+		return this.asset;
+	}
+}
+
+/** Mojang, as tests want it: who has "joined" which server id. */
+class FakeMojang implements Mojang {
+	joined = new Map<string, { id: string; name: string }>();
+	down = false;
+	async hasJoined(name: string, serverId: string) {
+		if (this.down) throw new Error("down");
+		const p = this.joined.get(serverId);
+		return p && p.name.toLowerCase() === name.toLowerCase() ? p : undefined;
+	}
 }
 
 function setup(over: Partial<LibraryConfig> = {}) {
@@ -61,9 +79,10 @@ function setup(over: Partial<LibraryConfig> = {}) {
 		webhookSecret: SECRET, builderOpenRepo: "MyriadClient/myriad-builder", builderClosedRepo: "MyriadClient/myriad-builder-private",
 		myriadOwnerId: MYRIAD_OWNER, deployHook: undefined, rootKeys: [ROOT.publicText], submissionsPerDay: 20, ...over,
 	};
-	const library = createLibrary(store.db, config, github, 1, now);
+	const mojang = new FakeMojang();
+	const library = createLibrary(store.db, config, github, 1, now, mojang);
 	const app = createApp(store, base, now, library);
-	return { app, library, github, store, advance: (ms: number) => { clock += ms; }, now };
+	return { app, library, github, store, mojang, advance: (ms: number) => { clock += ms; }, now };
 }
 
 type App = ReturnType<typeof setup>["app"];
@@ -434,4 +453,185 @@ test("one installation can't hold more than two builders at once", async () => {
 	await req(app, "POST", "/v1/library/builds/1/result", { outcome: "failed", reason: "x" }, OPEN);
 	await library.tick();
 	assert.equal(github.dispatched.length, 3, "the third goes once one finishes");
+});
+
+// ---- accounts and invite-only addons -------------------------------------------------------------------------------
+
+const PLAYER = { id: "0123456789abcdef0123456789abcdef", name: "Steve" };
+
+/** Links PLAYER (Mojang says they joined) and returns the session token. */
+async function signIn(app: App, mojang: FakeMojang, who = PLAYER) {
+	const { nonce } = await (await req(app, "POST", "/v1/auth/minecraft/start")).json() as { nonce: string };
+	mojang.joined.set(serverIdFor(nonce), who);
+	const res = await req(app, "POST", "/v1/auth/minecraft/finish", { nonce, name: who.name, label: "Laptop" });
+	assert.equal(res.status, 200);
+	return (await res.json() as { token: string }).token;
+}
+
+/** An invite-only listing (closed source, private releases repository 103) with version 1.0.0 as `jar`. */
+async function inviteOnly(app: App, library: ReturnType<typeof setup>["library"], jar: Buffer) {
+	await ready(app);
+	await hook(app, "installation", installation([{ id: 101, full_name: "dev/closed-addon", private: true }, { id: 103, full_name: "dev/secret-releases", private: true }]));
+	const l = listingDoc({ id: "closed-addon", repoId: 101, source: "closed", downloadRepoId: 103 });
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...l, doc: { ...l.doc, access: "invite" } }, ADMIN)).status, 200);
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { kind: "version", doc: versionDoc("1.0.0", sha256Hex(jar), LISTING, DEV, "closed-addon") }, ADMIN)).status, 200);
+	library.store.setVersionAsset("closed-addon", "1.0.0", 555);
+}
+
+let nonces = 0;
+function invite(r: Partial<InviteRequest> & { action: InviteRequest["action"] }, at: number, by = DEV) {
+	const request: InviteRequest = { id: "closed-addon", api: "https://api.myriadclient.dev", issued: Math.floor(at / 1000), nonce: `nonce-${String(nonces++).padStart(20, "0")}`, ...r };
+	return { request, signatures: [signWith(by, inviteBytes(request))] };
+}
+
+test("the server id is Java's signed hex of the link hash, as Minecraft spells it", () => {
+	// Minecraft's own examples of BigInteger(sha1(x)).toString(16).
+	const javaHex = (x: string) => {
+		const d = createHash("sha1").update(x).digest();
+		let n = BigInt("0x" + d.toString("hex"));
+		if (d[0]! & 0x80) n -= 1n << 160n;
+		return n < 0n ? "-" + (-n).toString(16) : n.toString(16);
+	};
+	assert.equal(javaHex("Notch"), "4ed1f46bbe04bc756bcb17c0c7ce3e4632f06a48");
+	assert.equal(javaHex("jeb_"), "-7c9d5b0044c130109a5d7b5fb5c317c02b4e28c1");
+	assert.equal(serverIdFor("abc"), javaHex("myriad-link:abc"));
+	// The same ids Myriad's core works out (its LibraryAccountTest pins them too).
+	assert.equal(serverIdFor("abc"), "375f420c445c6c3ef27ef2e2d1867e64ffbf384e");
+	assert.equal(serverIdFor("nonce-xyz"), "-6aebae44fe50d5f3f22011d471415ba00be48134");
+});
+
+test("linking needs Mojang to say the account joined, and each nonce works once", async () => {
+	const { app, mojang, advance } = setup();
+	const token = await signIn(app, mojang);
+	const me = await req(app, "GET", "/v1/auth/session", undefined, token);
+	assert.equal(me.status, 200);
+	assert.equal((await me.json() as { name: string }).name, "Steve");
+
+	const { nonce } = await (await req(app, "POST", "/v1/auth/minecraft/start")).json() as { nonce: string };
+	assert.equal((await req(app, "POST", "/v1/auth/minecraft/finish", { nonce, name: "Steve" })).status, 401, "Mojang never heard of it");
+	assert.equal((await req(app, "POST", "/v1/auth/minecraft/finish", { nonce, name: "Steve" })).status, 401, "a nonce works once, even after a failure");
+	const late = await (await req(app, "POST", "/v1/auth/minecraft/start")).json() as { nonce: string };
+	mojang.joined.set(serverIdFor(late.nonce), PLAYER);
+	advance(3 * 60_000);
+	assert.equal((await req(app, "POST", "/v1/auth/minecraft/finish", { nonce: late.nonce, name: "Steve" })).status, 401, "a stale nonce");
+	const other = await (await req(app, "POST", "/v1/auth/minecraft/start")).json() as { nonce: string };
+	mojang.joined.set(serverIdFor(other.nonce), PLAYER);
+	assert.equal((await req(app, "POST", "/v1/auth/minecraft/finish", { nonce: other.nonce, name: "Alex" })).status, 401, "another name");
+	mojang.down = true;
+	const down = await (await req(app, "POST", "/v1/auth/minecraft/start")).json() as { nonce: string };
+	assert.equal((await req(app, "POST", "/v1/auth/minecraft/finish", { nonce: down.nonce, name: "Steve" })).status, 503);
+
+	assert.equal((await req(app, "DELETE", "/v1/auth/session", undefined, token)).status, 200);
+	assert.equal((await req(app, "GET", "/v1/auth/session", undefined, token)).status, 401, "signed out");
+	assert.equal((await req(app, "GET", "/v1/auth/session", undefined, "myr_s_" + "a".repeat(43))).status, 401, "a made-up token");
+});
+
+test("sessions expire unused and can be listed and ended from another", async () => {
+	const { app, mojang, advance } = setup();
+	const a = await signIn(app, mojang), b = await signIn(app, mojang);
+	const list = await (await req(app, "GET", "/v1/auth/sessions", undefined, a)).json() as { id: number; current: boolean }[];
+	assert.equal(list.length, 2);
+	const theOther = list.find(x => !x.current)!;
+	assert.equal((await req(app, "DELETE", `/v1/auth/sessions/${theOther.id}`, undefined, a)).status, 200);
+	assert.equal((await req(app, "GET", "/v1/auth/session", undefined, b)).status, 401);
+	advance(31 * 24 * 3600_000);
+	assert.equal((await req(app, "GET", "/v1/auth/session", undefined, a)).status, 401, "30 days unused");
+});
+
+test("an invite-only listing's index entry has no download address", async () => {
+	const { app, library } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	const entry = (await index(app)).body.addons.find((a: { listing: { id: string } }) => a.listing.id === "closed-addon");
+	assert.equal(entry.info.access, "invite");
+	assert.equal(entry.versions[0].url, undefined);
+	const detail = await (await req(app, "GET", "/v1/library/addons/closed-addon")).json() as { versions: { url?: string }[]; access: string };
+	assert.equal(detail.access, "invite");
+	assert.equal(detail.versions[0]!.url, undefined);
+	const open = listingDoc();
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...open, doc: { ...open.doc, access: "invite" } }, ADMIN)).status, 422, "only closed listings");
+});
+
+test("developers manage invites with signed requests; codes are only ever hashes", async () => {
+	const { app, library, now } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	const code = "MYR-ABCDE-FGHIJ-KLMNO-PQRST-UVWXY-Z2";
+	const hash = sha256Hex(canonicalCode(code)!);
+	const create = invite({ action: "create", codeSha256: hash, uses: 2, notAfter: Math.floor(now() / 1000) + 3600, label: "friends" }, now());
+	const made = await req(app, "POST", "/v1/library/invites", create);
+	assert.equal(made.status, 200);
+	assert.equal((await req(app, "POST", "/v1/library/invites", create)).status, 409, "a request counts once");
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "list" }, now(), OTHER))).status, 403, "a stranger's key");
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "list" }, now() - 10 * 60_000))).status, 400, "a stale request");
+	const tampered = invite({ action: "list" }, now());
+	assert.equal((await req(app, "POST", "/v1/library/invites", { ...tampered, request: { ...tampered.request, id: "good-addon" } })).status, 404);
+	const list = await (await req(app, "POST", "/v1/library/invites", invite({ action: "list" }, now()))).json() as { id: number; usesLeft: number; label: string }[];
+	assert.deepEqual(list.map(i => [i.usesLeft, i.label]), [[2, "friends"]]);
+	assert.ok(!JSON.stringify(library.store.db.prepare("SELECT * FROM library_invites").all()).includes("ABCDE"), "the code isn't stored");
+});
+
+test("redeeming grants access once per code use, and only the right account downloads the exact jar", async () => {
+	const { app, library, mojang, github, now } = setup();
+	const jar = Buffer.alloc(1000, 7);
+	github.asset = jar;
+	await inviteOnly(app, library, jar);
+	const token = await signIn(app, mojang);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 403, "no grant yet");
+
+	const code = "myr-abcde-fghij-klmno-pqrst-uvwxy-z2";
+	const one = invite({ action: "create", codeSha256: sha256Hex(canonicalCode(code)!), uses: 1, notAfter: Math.floor(now() / 1000) + 3600 }, now());
+	assert.equal((await req(app, "POST", "/v1/library/invites", one)).status, 200);
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: "myr-wrong-code" }, token)).status, 404);
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code })).status, 401, "needs a session");
+	const ok = await req(app, "POST", "/v1/library/redeem", { code: code.toUpperCase().replaceAll("-", " ") }, token);
+	assert.equal(ok.status, 200, "case and separators don't matter");
+	assert.deepEqual(await (await req(app, "GET", "/v1/library/grants", undefined, token)).json(), ["closed-addon"]);
+
+	const alex = await signIn(app, mojang, { id: "fedcba9876543210fedcba9876543210", name: "Alex" });
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code }, alex)).status, 404, "a single-use code is spent");
+
+	const got = await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token);
+	assert.equal(got.status, 200);
+	assert.equal(got.headers.get("cache-control"), "no-store");
+	assert.deepEqual(Buffer.from(await got.arrayBuffer()), jar);
+	assert.deepEqual(github.assets.at(-1), { installation: 5, repoId: 103, repo: "dev/secret-releases", assetId: 555 });
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, alex)).status, 403, "another account");
+
+	github.asset = Buffer.alloc(1000, 8);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 502, "not the listed jar");
+	github.asset = jar;
+
+	const revoke = invite({ action: "revoke-grant", uuid: PLAYER.id }, now());
+	assert.equal((await req(app, "POST", "/v1/library/invites", revoke)).status, 200);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 403, "a revoked grant");
+
+	// A revoke sticks: another live code doesn't bring the player back, only the developer does.
+	const many = "myr-" + "E".repeat(27);
+	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(many)!), uses: 20, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: many }, token)).status, 404, "a revoked player can't redeem back in");
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "restore-grant", uuid: PLAYER.id }, now()))).status, 200);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 200, "restored by the developer");
+
+	// A request signed for another server never counts here.
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "list", api: "https://staging.example" }, now()))).status, 400);
+});
+
+test("redeeming is rate-limited per session", async () => {
+	const { app, library, mojang } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	const token = await signIn(app, mojang);
+	for (let i = 0; i < 10; i++) assert.equal((await req(app, "POST", "/v1/library/redeem", { code: `myr-${"A".repeat(26)}${i % 8 + 2}` }, token)).status, 404);
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: `myr-${"B".repeat(27)}` }, token)).status, 429);
+});
+
+test("an expired or revoked invite doesn't work", async () => {
+	const { app, library, mojang, now, advance } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	const token = await signIn(app, mojang);
+	const a = `myr-${"C".repeat(27)}`, b = `myr-${"D".repeat(27)}`;
+	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(a)!), uses: 5, notAfter: Math.floor(now() / 1000) + 60 }, now()));
+	const made = await (await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(b)!), uses: 5, notAfter: Math.floor(now() / 1000) + 3600 }, now()))).json() as { invite: number };
+	await req(app, "POST", "/v1/library/invites", invite({ action: "revoke", invite: made.invite }, now()));
+	advance(2 * 60_000);
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: a }, token)).status, 404, "expired");
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: b }, token)).status, 404, "revoked");
 });

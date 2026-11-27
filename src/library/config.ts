@@ -9,6 +9,8 @@ import { ROOT_KEYS } from "./rules.ts";
 export interface LibraryConfig {
 	/** `ed25519-private:...`: signs the index. */
 	indexKey?: string;
+	/** This API's public origin (default https://api.myriadclient.dev): developers' signed requests must name it. */
+	apiOrigin?: string;
 	adminTokenSha256?: string;
 	builderOpenTokenSha256?: string;
 	builderClosedTokenSha256?: string;

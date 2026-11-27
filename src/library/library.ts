@@ -9,8 +9,9 @@ import { type CheckRun, type GitHub, webhookSignatureValid } from "./github.ts";
 import {
 	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, detailsText, downloadable, listingLive, Refused, shown, versionInfo,
 } from "./rules.ts";
+import { accountRoutes, type Mojang, realMojang } from "./accounts.ts";
 import { approvedCheck, buildingCheck, listedCheck, queuedCheck, refusedCheck, reviewCheck } from "./checks.ts";
-import { InvalidStatement, privateKey } from "./statements.ts";
+import { InvalidStatement, MAX_JAR, privateKey } from "./statements.ts";
 import { type Builder, LibraryStore, type ListingRow, type SubmissionRow } from "./store.ts";
 
 const MINUTE = 60_000;
@@ -48,7 +49,8 @@ export interface Library {
  * Maintainer (admin token): `GET /v1/library/pending`, `POST /v1/library/submissions/:id/accept|reject`,
  * `POST /v1/library/approvals` (signed listings, versions, yanks, certificates), `POST /v1/library/listings/:id/pause`.
  */
-export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: GitHub | undefined, trustedProxies: number, now: () => number = Date.now): Library {
+export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: GitHub | undefined, trustedProxies: number, now: () => number = Date.now,
+	mojang: Mojang = realMojang): Library {
 	const lib = new LibraryStore(db);
 	const indexKey = config.indexKey ? privateKey(config.indexKey) : undefined;
 	const app = new Hono();
@@ -113,7 +115,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		return c.json({
 			...summary(lib, l),
 			versions: lib.versions(l.id).map(v => ({
-				version: v.version, minecraft: v.minecraft, sha256: v.sha256, size: v.size, url: v.url, commit: v.commit,
+				version: v.version, minecraft: v.minecraft, sha256: v.sha256, size: v.size, ...(l.access === "invite" ? {} : { url: v.url }), commit: v.commit,
 				added: new Date(v.createdAt).toISOString(), yanked: yanked.has(`${v.version}/${v.sha256}`),
 			})),
 		});
@@ -232,10 +234,13 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 			builder = "open";
 			status = "queued";
 		}
-		const asset = (Array.isArray(rel.assets) ? rel.assets : [])
-			.map((a: any) => String(a?.browser_download_url ?? ""))
-			.find((u: string) => downloadable(u) && !/-(sources|javadoc)\.jar$/.test(u));
-		const id = lib.addSubmission(repoId, String(rel.tag_name), asset ?? null, builder, status, t);
+		// The jar: its address (checked against the signed version later) and its asset id (to fetch it from a private
+		// releases repository, for an invite-only listing).
+		const chosen = (Array.isArray(rel.assets) ? rel.assets : [])
+			.find((a: any) => downloadable(String(a?.browser_download_url ?? "")) && !/-(sources|javadoc)\.jar$/.test(String(a?.browser_download_url)));
+		const asset = chosen ? String(chosen.browser_download_url) : undefined;
+		const assetId = chosen && Number.isSafeInteger(chosen.id) && chosen.id > 0 ? Number(chosen.id) : null;
+		const id = lib.addSubmission(repoId, String(rel.tag_name), asset ?? null, builder, status, t, assetId);
 		if (id === undefined) return;
 		check(id, queuedCheck(String(rel.tag_name), builder === "closed", status === "waiting"));
 		if (status === "queued") lib.addJob("dispatch", { submission: id }, t);
@@ -318,6 +323,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 				if (body.version?.url !== b.sub.assetUrl) throw new Refused("the version isn't this release's jar");
 				const added = lib.transaction(() => {
 					const r = acceptVersion(lib, config.rootKeys, body.version, t);
+					lib.setVersionAsset(own.id, String(body.version.version), b.sub.assetId);
 					const shownInfo = versionInfo(report);
 					lib.setVersionInfo(own.id, String(body.version.version), shownInfo.modules, shownInfo.changelog);
 					return r;
@@ -364,6 +370,21 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 			repo: lib.repo(s.repoId)?.fullName ?? null, repoId: s.repoId, ownerId: lib.repo(s.repoId)?.ownerId ?? null,
 			listing: lib.listingForRepo(s.repoId)?.id ?? null, report: s.report, created: new Date(s.createdAt).toISOString(),
 		})));
+	});
+
+	/** A submission's released jar from a private repository, for the maintainer's review tool (admin only). */
+	app.get("/v1/library/submissions/:id/jar", async c => {
+		const no = adminOnly(c);
+		if (no) return no;
+		const sub = lib.submission(Number(c.req.param("id")));
+		const repo = sub && lib.repo(sub.repoId);
+		if (!sub || !repo || !sub.assetId || !github) return c.json({ error: "No jar for that submission" }, 404);
+		try {
+			const jar = await github.assetBytes(repo.installationId, repo.id, repo.fullName, sub.assetId, MAX_JAR);
+			return c.body(new Uint8Array(jar), 200, { "Content-Type": "application/java-archive", "Cache-Control": "no-store" });
+		} catch {
+			return c.json({ error: "Its release couldn't be fetched" }, 502);
+		}
 	});
 
 	app.post("/v1/library/submissions/:id/accept", c => {
@@ -417,6 +438,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 					}
 					case "version": {
 						acceptVersion(lib, config.rootKeys, body.doc, t);
+						if (sub) lib.setVersionAsset(String(body.doc.id), String(body.doc.version), sub.assetId);
 						// A reviewed version shows what its build's report said, and refreshes the listing's icon.
 						if (sub?.report) {
 							const shownInfo = versionInfo(sub.report);
@@ -513,11 +535,15 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		}
 	}
 
+	// Players' accounts and invite-only addons (accounts.ts).
+	const accounts = accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigin: config.apiOrigin ?? "https://api.myriadclient.dev" });
+
 	function start(): void {
 		setInterval(() => void tick(), 30_000).unref();
 		setInterval(() => {
 			reads.sweep(now());
 			writes.sweep(now());
+			accounts.sweep();
 			lib.forgetDeliveries(now() - 30 * 24 * HOUR);
 		}, 10 * MINUTE).unref();
 		if (indexKey) {
@@ -534,7 +560,7 @@ function summary(lib: LibraryStore, l: ListingRow) {
 	const latest = lib.versions(l.id, 1)[0];
 	return {
 		id: l.id, name: l.name, description: l.description, author: l.author, repo: l.repoName || null,
-		badge: l.source === "open" ? "verified" : "reviewed", icon: lib.icon(l.id) ? `/v1/library/addons/${l.id}/icon.png` : null,
+		badge: l.source === "open" ? "verified" : "reviewed", icon: lib.icon(l.id) ? `/v1/library/addons/${l.id}/icon.png` : null, access: l.access,
 		latest: latest ? { version: latest.version, minecraft: latest.minecraft, added: new Date(latest.createdAt).toISOString() } : null,
 		modules: latest?.modules ?? [],
 		changelog: latest?.changelog ? { version: latest.version, text: latest.changelog } : null,

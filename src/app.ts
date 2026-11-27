@@ -22,8 +22,8 @@ const HOUR = 60 * MINUTE;
  *
  * And the Myriad Library's routes (library/library.ts), when it's set up.
  *
- * There are no accounts and no cookies, so nothing can be done in a visitor's name; what's stored is public to anyone
- * with its code. Every route is limited per client, and publishing also has a ceiling for everyone together.
+ * There are no cookies. Accounts exist only for invite-only Library addons (library/accounts.ts): a Minecraft account
+ * proved through Mojang, a bearer session kept only as a hash. A share is public to anyone with its code. Every route is limited per client, and publishing also has a ceiling for everyone together.
  * Addresses are only kept in memory, for the limits, and never stored.
  */
 export function createApp(store: Store, config: Config, now: () => number = Date.now, library?: Library): Hono {

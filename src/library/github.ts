@@ -10,7 +10,15 @@ export interface GitHub {
 	updateCheckRun(installationId: number, repoFullName: string, id: number, run: CheckRun): Promise<void>;
 	/** Starts the builder workflow for one submission (with the private dispatch App). */
 	dispatch(builderRepo: string, submission: number): Promise<void>;
+	/**
+	 * A release asset's bytes from a (private) repository, with a token for that repository alone, read-only; at most
+	 * `max` bytes. For invite-only listings: the API hands the jar only to accounts with a grant.
+	 */
+	assetBytes(installationId: number, repoId: number, repoFullName: string, assetId: number, max: number): Promise<Buffer>;
 }
+
+/** Where GitHub sends asset downloads: its own storage hosts, and nowhere else. */
+const ASSET_HOSTS = /^(?:objects|release-assets|github-releases)\.githubusercontent\.com$/;
 
 export interface CheckRun {
 	status: "queued" | "in_progress" | "completed";
@@ -85,6 +93,34 @@ export class RealGitHub implements GitHub {
 		const r = await this.call(appJwt(appId, key), "POST", `/app/installations/${installationId}/access_tokens`, body, "Bearer") as { token?: unknown };
 		if (typeof r?.token !== "string") throw new Error("GitHub gave no token");
 		return r.token;
+	}
+
+	async assetBytes(installationId: number, repoId: number, repoFullName: string, assetId: number, max: number): Promise<Buffer> {
+		if (!REPO.test(repoFullName) || !Number.isSafeInteger(assetId) || assetId <= 0 || !Number.isSafeInteger(repoId)) throw new Error("odd repository or asset");
+		const token = await this.installationToken(installationId, { repositoryIds: [repoId], permissions: { contents: "read" } });
+		const first = await fetch(`${API}/repos/${repoFullName}/releases/assets/${assetId}`, {
+			headers: { Accept: "application/octet-stream", Authorization: `token ${token}`, "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "myriad-library" },
+			redirect: "manual",
+			signal: AbortSignal.timeout(30_000),
+		});
+		let res = first;
+		if (first.status >= 300 && first.status < 400) {
+			// The bytes are on GitHub's storage, behind a short-lived signed address: fetched without our token.
+			const to = new URL(first.headers.get("location") ?? "", API);
+			if (to.protocol !== "https:" || !ASSET_HOSTS.test(to.hostname)) throw new Error("GitHub sent the asset somewhere unexpected");
+			res = await fetch(to, { headers: { "User-Agent": "myriad-library" }, redirect: "error", signal: AbortSignal.timeout(60_000) });
+		}
+		if (!res.ok || !res.body) throw new Error(`GitHub asset: HTTP ${res.status}`);
+		const declared = Number(res.headers.get("content-length") ?? "0");
+		if (declared > max) throw new Error("the asset is too big");
+		const chunks: Buffer[] = [];
+		let size = 0;
+		for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+			size += chunk.length;
+			if (size > max) throw new Error("the asset is too big");
+			chunks.push(Buffer.from(chunk));
+		}
+		return Buffer.concat(chunks);
 	}
 
 	async commitOf(installationId: number, repoFullName: string, tag: string): Promise<string> {

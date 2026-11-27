@@ -167,6 +167,56 @@ export function releaseBytes(v: Omit<Version, "commit">): Buffer {
 	return ascii(`myriad-addon-release:1\nid=${v.id}\nversion=${v.version}\nsize=${v.size}\nsha256=${v.sha256}\n`);
 }
 
+/** What a developer can ask of an invite-only listing's invites, with a key the listing names. */
+export type InviteAction = "create" | "list" | "revoke" | "grants" | "revoke-grant" | "restore-grant";
+
+/**
+ * A developer's request about their listing's invites (`myriad-library-invite:1`): who (`id`), what, which API it's for
+ * (`api`, its origin: a request signed for another server never counts here), when it was made (`issued`, unix seconds;
+ * the API takes it only within minutes) and a one-time `nonce`, then what the action needs, always in this order:
+ * `code-sha256` and `uses`, `not-after` and `label` (create); `invite` (revoke); `uuid` (revoke-grant, restore-grant).
+ * The code itself is never in it: the developer's tool makes the code and sends only its hash.
+ */
+export interface InviteRequest {
+	id: string;
+	action: InviteAction;
+	api: string;
+	issued: number;
+	nonce: string;
+	codeSha256?: string;
+	uses?: number;
+	notAfter?: number;
+	label?: string;
+	invite?: number;
+	uuid?: string;
+}
+
+export const NONCE = /^[A-Za-z0-9_-]{22,64}$/;
+export const UUID = /^[0-9a-f]{32}$/;
+const LABEL = /^[ -~]{0,40}$/;
+
+export function inviteBytes(r: InviteRequest): Buffer {
+	check(ID.test(r.id), "not a mod id");
+	check(["create", "list", "revoke", "grants", "revoke-grant", "restore-grant"].includes(r.action), "not an invite action");
+	check(/^https?:\/\/[a-z0-9.-]{1,253}(?::\d{1,5})?$/.test(r.api), "not an API origin");
+	positive(r.issued, "issued");
+	check(NONCE.test(r.nonce), "not a nonce");
+	let out = `myriad-library-invite:1\nid=${r.id}\naction=${r.action}\napi=${r.api}\nissued=${r.issued}\nnonce=${r.nonce}\n`;
+	if (r.action === "create") {
+		check(SHA256.test(r.codeSha256 ?? ""), "not a code hash");
+		check(positive(r.uses, "uses") <= 10_000, "too many uses");
+		positive(r.notAfter, "not-after");
+		check(LABEL.test(r.label ?? "") && !(r.label ?? "").includes("="), "a label is up to 40 plain characters");
+		out += `code-sha256=${r.codeSha256}\nuses=${r.uses}\nnot-after=${r.notAfter}\nlabel=${r.label ?? ""}\n`;
+	} else if (r.action === "revoke") {
+		out += `invite=${positive(r.invite, "invite")}\n`;
+	} else if (r.action === "revoke-grant" || r.action === "restore-grant") {
+		check(UUID.test(r.uuid ?? ""), "not a player's UUID");
+		out += `uuid=${r.uuid}\n`;
+	}
+	return ascii(out);
+}
+
 // ---- keys and signatures ----------------------------------------------------------------------------------------
 
 const SPKI = Buffer.from("302a300506032b6570032100", "hex");

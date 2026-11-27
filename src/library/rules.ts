@@ -47,7 +47,7 @@ export function keys(store: LibraryStore, roots: string[], nowSeconds: number): 
 	return out;
 }
 
-function sigs(v: unknown): Sig[] {
+export function sigs(v: unknown): Sig[] {
 	if (!Array.isArray(v) || v.length === 0 || v.length > 8) throw new Refused("signatures aren't a short list");
 	return v.map(s => {
 		if (!s || typeof s !== "object" || typeof s.key !== "string" || typeof s.sig !== "string" || s.key.length > 32 || s.sig.length > 100) throw new Refused("a signature isn't one");
@@ -164,8 +164,13 @@ export function acceptListing(store: LibraryStore, roots: string[], body: unknow
 	if (accepted.length > 0 && !signer(acceptedBytes(l.id, l.revision, accepted), acceptedSigs, keys(store, roots, Math.floor(now / 1000)).listing)) {
 		throw new Refused("the accepted findings aren't signed by a Myriad listing key");
 	}
+	// Invite-only is the maintainer's setting (this route is theirs), not part of what the listing key signs: what keeps an
+	// invite-only jar from anyone without a grant is the private repository and the API's check, never this flag.
+	if (o.access !== undefined && o.access !== "invite" && o.access !== "public") throw new Refused("access is public or invite");
+	const access: "public" | "invite" = o.access === "invite" ? "invite" : o.access === "public" ? "public" : before?.access ?? "public";
+	if (access === "invite" && l.source !== "closed") throw new Refused("only a closed-source listing can be invite-only");
 	const row = {
-		...l, provides: [...new Set(l.provides)].sort(), keys: [...new Set(l.keys)].sort(), sigs: s, accepted: [...new Set(accepted)].sort(), acceptedSigs,
+		...l, access, provides: [...new Set(l.provides)].sort(), keys: [...new Set(l.keys)].sort(), sigs: s, accepted: [...new Set(accepted)].sort(), acceptedSigs,
 		name: shown(info.name, 64) || l.id, description: shown(info.description, 300), author: shown(info.author, 64),
 		repoName: /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/.test(repoName) ? repoName : before?.repoName ?? "",
 	};
@@ -224,7 +229,8 @@ export function listingLive(store: LibraryStore, l: ListingRow): boolean {
 		const r = store.repo(id);
 		return r !== undefined && !r.removed && r.ownerId === l.ownerId && !(mustBePublic && r.private);
 	};
-	return l.source === "open" ? ok(l.repoId, true) : ok(l.repoId, false) && ok(l.downloadRepoId, true);
+	// An invite-only listing's releases repository is private: its jars go out only through the API, to accounts with a grant.
+	return l.source === "open" ? ok(l.repoId, true) : ok(l.repoId, false) && ok(l.downloadRepoId, l.access !== "invite");
 }
 
 /**
@@ -246,8 +252,9 @@ export function buildSnapshot(store: LibraryStore, indexKey: ReturnType<typeof p
 				...(l.source === "closed" ? { downloadRepoId: l.downloadRepoId } : {}), build: l.build, provides: l.provides, keys: l.keys, signatures: l.sigs,
 			},
 			info: info(store, l),
+			// An invite-only listing's versions carry no address: their jars come only from the API, for accounts with a grant.
 			versions: store.versions(l.id).map(v => ({
-				version: v.version, size: v.size, sha256: v.sha256, commit: v.commit, url: v.url, ...(v.minecraft ? { minecraft: v.minecraft } : {}),
+				version: v.version, size: v.size, sha256: v.sha256, commit: v.commit, ...(l.access === "invite" ? {} : { url: v.url }), ...(v.minecraft ? { minecraft: v.minecraft } : {}),
 				signatures: v.sigs, developer: v.developer,
 			})),
 			yanks: store.yanks(l.id).map(y => ({ version: y.version, sha256: y.sha256, signatures: y.sigs })),
@@ -280,6 +287,7 @@ function info(store: LibraryStore, l: ListingRow) {
 	const modules = store.versions(l.id, 1)[0]?.modules?.length ?? 0;
 	return {
 		name: l.name, description: l.description, author: l.author, repo: l.repoName,
+		...(l.access === "invite" ? { access: "invite" } : {}),
 		...(icon ? { icon: sha256Hex(icon) } : {}),
 		...(details ? { details: sha256Hex(Buffer.from(details, "utf8")), moduleCount: modules } : {}),
 	};
