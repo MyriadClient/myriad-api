@@ -1,24 +1,17 @@
 import { createHmac, createSign, timingSafeEqual } from "node:crypto";
 
-/** What the Library needs from GitHub. The real one talks to api.github.com; tests use a fake. */
+/**
+ * What the API needs from GitHub: only to start a workflow in one of Myriad's own builder repositories, with the Dispatch
+ * App (installed on those two repositories alone). The API holds no key to developers' repositories: the Library App's
+ * key lives in the private builder, which reads releases and posts check runs itself and reports here. Tests use a fake.
+ */
 export interface GitHub {
-	/** A token for one installation, limited to `repositoryIds` and `permissions` when given (an hour at most). */
-	installationToken(installationId: number, scope?: { repositoryIds: number[]; permissions: Record<string, "read" | "write"> }): Promise<string>;
-	/** The commit a tag points at, in a repository the installation can see. */
-	commitOf(installationId: number, repoFullName: string, tag: string): Promise<string>;
-	createCheckRun(installationId: number, repoFullName: string, headSha: string, run: CheckRun): Promise<number>;
-	updateCheckRun(installationId: number, repoFullName: string, id: number, run: CheckRun): Promise<void>;
-	/** Starts the builder workflow for one submission (with the private dispatch App). */
-	dispatch(builderRepo: string, submission: number): Promise<void>;
-	/**
-	 * A release asset's bytes from a (private) repository, with a token for that repository alone, read-only; at most
-	 * `max` bytes. For invite-only listings: the API hands the jar only to accounts with a grant.
-	 */
-	assetBytes(installationId: number, repoId: number, repoFullName: string, assetId: number, max: number): Promise<Buffer>;
+	/** Starts `workflow` on `builderRepo`'s main branch with string `inputs`. */
+	dispatch(builderRepo: string, workflow: Workflow, inputs: Record<string, string>): Promise<void>;
 }
 
-/** Where GitHub sends asset downloads: its own storage hosts, and nowhere else. */
-const ASSET_HOSTS = /^(?:objects|release-assets|github-releases)\.githubusercontent\.com$/;
+/** The builder workflows the API starts: a build for one submission, or posting the check runs waiting to be posted. */
+export type Workflow = "build.yml" | "checks.yml";
 
 export interface CheckRun {
 	status: "queued" | "in_progress" | "completed";
@@ -32,7 +25,6 @@ export interface CheckRun {
 export const CHECK_NAME = "Myriad Library";
 const API = "https://api.github.com";
 const REPO = /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/;
-const TAG = /^[A-Za-z0-9._+-]{1,100}$/;
 
 /** Whether `signature` (the `X-Hub-Signature-256` header) is GitHub's HMAC of `body` with `secret`. Constant time. */
 export function webhookSignatureValid(secret: string, body: Buffer, signature: string | undefined): boolean {
@@ -50,8 +42,6 @@ export function appJwt(appId: string, privateKeyPem: string, nowSeconds = Math.f
 }
 
 export interface GitHubConfig {
-	appId: string;
-	appKey: string;
 	dispatchAppId: string;
 	dispatchAppKey: string;
 	dispatchInstallationId: number;
@@ -83,76 +73,18 @@ export class RealGitHub implements GitHub {
 		return text ? JSON.parse(text) : undefined;
 	}
 
-	async installationToken(installationId: number, scope?: { repositoryIds: number[]; permissions: Record<string, "read" | "write"> }): Promise<string> {
-		return this.tokenFor(this.config.appId, this.config.appKey, installationId, scope);
-	}
-
-	private async tokenFor(appId: string, key: string, installationId: number, scope?: { repositoryIds: number[]; permissions: Record<string, "read" | "write"> }): Promise<string> {
-		if (!Number.isSafeInteger(installationId) || installationId <= 0) throw new Error("not an installation");
-		const body = scope ? { repository_ids: scope.repositoryIds, permissions: scope.permissions } : undefined;
-		const r = await this.call(appJwt(appId, key), "POST", `/app/installations/${installationId}/access_tokens`, body, "Bearer") as { token?: unknown };
+	async dispatch(builderRepo: string, workflow: Workflow, inputs: Record<string, string>): Promise<void> {
+		if (!REPO.test(builderRepo) || !["build.yml", "checks.yml"].includes(workflow)) throw new Error("odd builder repository or workflow");
+		const id = this.config.dispatchInstallationId;
+		if (!Number.isSafeInteger(id) || id <= 0) throw new Error("not an installation");
+		const r = await this.call(appJwt(this.config.dispatchAppId, this.config.dispatchAppKey), "POST", `/app/installations/${id}/access_tokens`, undefined, "Bearer") as { token?: unknown };
 		if (typeof r?.token !== "string") throw new Error("GitHub gave no token");
-		return r.token;
-	}
-
-	async assetBytes(installationId: number, repoId: number, repoFullName: string, assetId: number, max: number): Promise<Buffer> {
-		if (!REPO.test(repoFullName) || !Number.isSafeInteger(assetId) || assetId <= 0 || !Number.isSafeInteger(repoId)) throw new Error("odd repository or asset");
-		const token = await this.installationToken(installationId, { repositoryIds: [repoId], permissions: { contents: "read" } });
-		const first = await fetch(`${API}/repos/${repoFullName}/releases/assets/${assetId}`, {
-			headers: { Accept: "application/octet-stream", Authorization: `token ${token}`, "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "myriad-library" },
-			redirect: "manual",
-			signal: AbortSignal.timeout(30_000),
-		});
-		let res = first;
-		if (first.status >= 300 && first.status < 400) {
-			// The bytes are on GitHub's storage, behind a short-lived signed address: fetched without our token.
-			const to = new URL(first.headers.get("location") ?? "", API);
-			if (to.protocol !== "https:" || !ASSET_HOSTS.test(to.hostname)) throw new Error("GitHub sent the asset somewhere unexpected");
-			res = await fetch(to, { headers: { "User-Agent": "myriad-library" }, redirect: "error", signal: AbortSignal.timeout(60_000) });
-		}
-		if (!res.ok || !res.body) throw new Error(`GitHub asset: HTTP ${res.status}`);
-		const declared = Number(res.headers.get("content-length") ?? "0");
-		if (declared > max) throw new Error("the asset is too big");
-		const chunks: Buffer[] = [];
-		let size = 0;
-		for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-			size += chunk.length;
-			if (size > max) throw new Error("the asset is too big");
-			chunks.push(Buffer.from(chunk));
-		}
-		return Buffer.concat(chunks);
-	}
-
-	async commitOf(installationId: number, repoFullName: string, tag: string): Promise<string> {
-		if (!REPO.test(repoFullName) || !TAG.test(tag)) throw new Error("odd repository or tag");
-		const token = await this.installationToken(installationId);
-		const r = await this.call(token, "GET", `/repos/${repoFullName}/commits/${encodeURIComponent(tag)}`) as { sha?: unknown };
-		if (typeof r?.sha !== "string" || !/^[0-9a-f]{40}$/.test(r.sha)) throw new Error("GitHub gave no commit");
-		return r.sha;
-	}
-
-	async createCheckRun(installationId: number, repoFullName: string, headSha: string, run: CheckRun): Promise<number> {
-		if (!REPO.test(repoFullName) || !/^[0-9a-f]{40}$/.test(headSha)) throw new Error("odd repository or commit");
-		const token = await this.installationToken(installationId);
-		const r = await this.call(token, "POST", `/repos/${repoFullName}/check-runs`, { name: CHECK_NAME, head_sha: headSha, ...checkBody(run) }) as { id?: unknown };
-		if (typeof r?.id !== "number") throw new Error("GitHub gave no check run");
-		return r.id;
-	}
-
-	async updateCheckRun(installationId: number, repoFullName: string, id: number, run: CheckRun): Promise<void> {
-		if (!REPO.test(repoFullName)) throw new Error("odd repository");
-		const token = await this.installationToken(installationId);
-		await this.call(token, "PATCH", `/repos/${repoFullName}/check-runs/${id}`, checkBody(run));
-	}
-
-	async dispatch(builderRepo: string, submission: number): Promise<void> {
-		if (!REPO.test(builderRepo)) throw new Error("odd builder repository");
-		const token = await this.tokenFor(this.config.dispatchAppId, this.config.dispatchAppKey, this.config.dispatchInstallationId);
-		await this.call(token, "POST", `/repos/${builderRepo}/actions/workflows/build.yml/dispatches`, { ref: "main", inputs: { submission: String(submission) } });
+		await this.call(r.token, "POST", `/repos/${builderRepo}/actions/workflows/${workflow}/dispatches`, { ref: "main", inputs });
 	}
 }
 
-function checkBody(run: CheckRun) {
+/** A check run as GitHub's API takes it, within GitHub's limits: what the builder posts for the API. */
+export function checkBody(run: CheckRun) {
 	return {
 		status: run.status,
 		...(run.status === "completed" ? { conclusion: run.conclusion ?? "neutral" } : {}),

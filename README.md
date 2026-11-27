@@ -74,7 +74,7 @@ Each part is off until its settings are set (tokens are given as SHA-256 hex has
 | `LIBRARY_ADMIN_TOKEN_SHA256` | the maintainer's token, hashed |
 | `LIBRARY_BUILDER_OPEN_TOKEN_SHA256`, `LIBRARY_BUILDER_CLOSED_TOKEN_SHA256` | the two builders' tokens, hashed |
 | `GITHUB_WEBHOOK_SECRET` | the Library App's webhook secret |
-| `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | the Library App (PEM, newlines as `\n`) |
+| (none for the Library App) | its key lives only in the private builder; the API keeps no key to developers' repositories |
 | `GITHUB_DISPATCH_APP_ID`, `GITHUB_DISPATCH_PRIVATE_KEY`, `GITHUB_DISPATCH_INSTALLATION_ID` | the private App that starts builder runs |
 | `LIBRARY_BUILDER_OPEN_REPO`, `LIBRARY_BUILDER_CLOSED_REPO` | `MyriadClient/myriad-builder`, `MyriadClient/myriad-builder-private` |
 | `MYRIAD_OWNER_ID` | GitHub's number for the MyriadClient organisation (its repositories may use Myriad's reserved ids) |

@@ -73,4 +73,8 @@ test("invite requests are spelled as the Gradle plugin spells them", async () =>
 		"myriad-library-invite:1\nid=closed-addon\naction=create\napi=https://api.myriadclient.dev\nissued=1800000000\nnonce=nonce-00000000000000000000\ncode-sha256=" + "a".repeat(64) + "\nuses=2\nnot-after=1800003600\nlabel=friends\n");
 	assert.equal(inviteBytes({ id: "closed-addon", action: "revoke-grant", api: "https://api.myriadclient.dev", issued: 1800000000, nonce: "nonce-00000000000000000001", uuid: "0123456789abcdef0123456789abcdef" }).toString("ascii"),
 		"myriad-library-invite:1\nid=closed-addon\naction=revoke-grant\napi=https://api.myriadclient.dev\nissued=1800000000\nnonce=nonce-00000000000000000001\nuuid=0123456789abcdef0123456789abcdef\n");
+	assert.equal(inviteBytes({ id: "closed-addon", action: "revoke-all", api: "https://api.myriadclient.dev", issued: 1800000000, nonce: "nonce-00000000000000000003", invite: 7 }).toString("ascii"),
+		"myriad-library-invite:1\nid=closed-addon\naction=revoke-all\napi=https://api.myriadclient.dev\nissued=1800000000\nnonce=nonce-00000000000000000003\ninvite=7\n");
+	assert.equal(inviteBytes({ id: "closed-addon", action: "show", api: "https://api.myriadclient.dev", issued: 1800000000, nonce: "nonce-00000000000000000004", show: ["changelog", "repo"] }).toString("ascii"),
+		"myriad-library-invite:1\nid=closed-addon\naction=show\napi=https://api.myriadclient.dev\nissued=1800000000\nnonce=nonce-00000000000000000004\nshow=changelog,repo\n");
 });

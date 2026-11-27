@@ -1,7 +1,7 @@
 import type { LibraryStore, ListingRow, ModuleInfo } from "./store.ts";
 import {
 	acceptedBytes, ID, InvalidStatement, isKey, keyCertBytes, listingBytes, releaseBytes, revocationsBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes,
-	type KeyCert, type Listing, type privateKey, type Role, type Sig,
+	type KeyCert, type Listing, type privateKey, type Role, type Showable, type Sig,
 } from "./statements.ts";
 
 /**
@@ -169,6 +169,7 @@ export function acceptListing(store: LibraryStore, roots: string[], body: unknow
 	if (o.access !== undefined && o.access !== "invite" && o.access !== "public") throw new Refused("access is public or invite");
 	const access: "public" | "invite" = o.access === "invite" ? "invite" : o.access === "public" ? "public" : before?.access ?? "public";
 	if (access === "invite" && l.source !== "closed") throw new Refused("only a closed-source listing can be invite-only");
+	if (access === "invite" && store.repo(l.downloadRepoId)?.private !== true) throw new Refused("an invite-only listing's releases repository must be private (and known to the Library App)");
 	const row = {
 		...l, access, provides: [...new Set(l.provides)].sort(), keys: [...new Set(l.keys)].sort(), sigs: s, accepted: [...new Set(accepted)].sort(), acceptedSigs,
 		name: shown(info.name, 64) || l.id, description: shown(info.description, 300), author: shown(info.author, 64),
@@ -230,7 +231,16 @@ export function listingLive(store: LibraryStore, l: ListingRow): boolean {
 		return r !== undefined && !r.removed && r.ownerId === l.ownerId && !(mustBePublic && r.private);
 	};
 	// An invite-only listing's releases repository is private: its jars go out only through the API, to accounts with a grant.
-	return l.source === "open" ? ok(l.repoId, true) : ok(l.repoId, false) && ok(l.downloadRepoId, l.access !== "invite");
+	if (l.source === "open") return ok(l.repoId, true);
+	if (!ok(l.repoId, false) || !ok(l.downloadRepoId, l.access !== "invite")) return false;
+	// Checked from state too, not only on GitHub's "publicized" event: a missed event mustn't leave its jars listed as
+	// invite-only while anyone can download them.
+	return l.access !== "invite" || store.repo(l.downloadRepoId)?.private === true;
+}
+
+/** Whether everyone may see `what` of a listing: always for a public one; for an invite-only one, if its developer chose. */
+export function showsAll(l: ListingRow, what: Showable): boolean {
+	return l.access !== "invite" || l.shows.includes(what);
 }
 
 /**
@@ -274,10 +284,12 @@ export function buildSnapshot(store: LibraryStore, indexKey: ReturnType<typeof p
  * served at /v1/library/addons/:id/details.json. Kept out of the signed index (which every client reads whole, under a
  * size cap) and tied to it by its hash, like the icon. The same text every time for the same data.
  */
-export function detailsText(store: LibraryStore, l: ListingRow): string | undefined {
+export function detailsText(store: LibraryStore, l: ListingRow, granted = false): string | undefined {
 	const latest = store.versions(l.id, 1)[0];
-	if (!latest || (!latest.modules?.length && !latest.changelog)) return undefined;
-	return JSON.stringify({ id: l.id, version: latest.version, modules: latest.modules ?? [], changelog: latest.changelog ?? null });
+	// An invite-only listing's changelog is for its players unless its developer shows it to everyone; modules always show.
+	const changelog = granted || showsAll(l, "changelog") ? latest?.changelog ?? null : null;
+	if (!latest || (!latest.modules?.length && !changelog)) return undefined;
+	return JSON.stringify({ id: l.id, version: latest.version, modules: latest.modules ?? [], changelog });
 }
 
 /** The display half of a listing's index entry: who and what it is, and the hashes of its icon and its details. */
@@ -286,7 +298,7 @@ function info(store: LibraryStore, l: ListingRow) {
 	const details = detailsText(store, l);
 	const modules = store.versions(l.id, 1)[0]?.modules?.length ?? 0;
 	return {
-		name: l.name, description: l.description, author: l.author, repo: l.repoName,
+		name: l.name, description: l.description, author: l.author, ...(showsAll(l, "repo") ? { repo: l.repoName } : {}),
 		...(l.access === "invite" ? { access: "invite" } : {}),
 		...(icon ? { icon: sha256Hex(icon) } : {}),
 		...(details ? { details: sha256Hex(Buffer.from(details, "utf8")), moduleCount: modules } : {}),

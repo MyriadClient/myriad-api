@@ -168,13 +168,19 @@ export function releaseBytes(v: Omit<Version, "commit">): Buffer {
 }
 
 /** What a developer can ask of an invite-only listing's invites, with a key the listing names. */
-export type InviteAction = "create" | "list" | "revoke" | "grants" | "revoke-grant" | "restore-grant";
+export type InviteAction = "create" | "list" | "revoke" | "revoke-all" | "grants" | "revoke-grant" | "restore-grant" | "show";
+
+/** What an invite-only listing may choose to show everyone; the module list always shows. */
+export const SHOWABLE = ["changelog", "repo"] as const;
+export type Showable = (typeof SHOWABLE)[number];
 
 /**
  * A developer's request about their listing's invites (`myriad-library-invite:1`): who (`id`), what, which API it's for
  * (`api`, its origin: a request signed for another server never counts here), when it was made (`issued`, unix seconds;
  * the API takes it only within minutes) and a one-time `nonce`, then what the action needs, always in this order:
- * `code-sha256` and `uses`, `not-after` and `label` (create); `invite` (revoke); `uuid` (revoke-grant, restore-grant).
+ * `code-sha256` and `uses`, `not-after` and `label` (create); `invite` (revoke, and revoke-all, which also revokes every
+ * grant the code made); `uuid` (revoke-grant, restore-grant); `show` (show: what everyone may see beyond the modules, a
+ * sorted comma list of `changelog` and `repo`, empty for nothing).
  * The code itself is never in it: the developer's tool makes the code and sends only its hash.
  */
 export interface InviteRequest {
@@ -189,6 +195,7 @@ export interface InviteRequest {
 	label?: string;
 	invite?: number;
 	uuid?: string;
+	show?: Showable[];
 }
 
 export const NONCE = /^[A-Za-z0-9_-]{22,64}$/;
@@ -197,7 +204,7 @@ const LABEL = /^[ -~]{0,40}$/;
 
 export function inviteBytes(r: InviteRequest): Buffer {
 	check(ID.test(r.id), "not a mod id");
-	check(["create", "list", "revoke", "grants", "revoke-grant", "restore-grant"].includes(r.action), "not an invite action");
+	check(["create", "list", "revoke", "revoke-all", "grants", "revoke-grant", "restore-grant", "show"].includes(r.action), "not an invite action");
 	check(/^https?:\/\/[a-z0-9.-]{1,253}(?::\d{1,5})?$/.test(r.api), "not an API origin");
 	positive(r.issued, "issued");
 	check(NONCE.test(r.nonce), "not a nonce");
@@ -208,11 +215,16 @@ export function inviteBytes(r: InviteRequest): Buffer {
 		positive(r.notAfter, "not-after");
 		check(LABEL.test(r.label ?? "") && !(r.label ?? "").includes("="), "a label is up to 40 plain characters");
 		out += `code-sha256=${r.codeSha256}\nuses=${r.uses}\nnot-after=${r.notAfter}\nlabel=${r.label ?? ""}\n`;
-	} else if (r.action === "revoke") {
+	} else if (r.action === "revoke" || r.action === "revoke-all") {
 		out += `invite=${positive(r.invite, "invite")}\n`;
 	} else if (r.action === "revoke-grant" || r.action === "restore-grant") {
 		check(UUID.test(r.uuid ?? ""), "not a player's UUID");
 		out += `uuid=${r.uuid}\n`;
+	} else if (r.action === "show") {
+		const show = r.show ?? [];
+		check(Array.isArray(show) && show.every(x => (SHOWABLE as readonly string[]).includes(x)), "show is changelog and/or repo");
+		check(show.join(",") === [...new Set(show)].sort().join(","), "show is sorted, each once");
+		out += `show=${show.join(",")}\n`;
 	}
 	return ascii(out);
 }

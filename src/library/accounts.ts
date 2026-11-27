@@ -15,9 +15,8 @@ import type { Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { DatabaseSync } from "node:sqlite";
 import { RateLimit } from "../rateLimit.ts";
-import type { GitHub } from "./github.ts";
-import { listingLive, shown, sigs } from "./rules.ts";
-import { inviteBytes, InvalidStatement, type InviteAction, type InviteRequest, MAX_JAR, NONCE, signer, UUID } from "./statements.ts";
+import { detailsText, listingLive, shown, sigs } from "./rules.ts";
+import { inviteBytes, InvalidStatement, type InviteAction, type InviteRequest, NONCE, type Showable, signer, UUID } from "./statements.ts";
 import type { LibraryStore } from "./store.ts";
 
 const MINUTE = 60_000;
@@ -27,8 +26,6 @@ const NONCE_LIFE = 2 * MINUTE;
 const SESSION_LIFE = 30 * DAY;
 /** However much it's used, a session ends this long after it was made: signing in again proves the account afresh. */
 const SESSION_MAX = 90 * DAY;
-/** Private downloads fetched from GitHub at once, over everyone (each holds a jar in memory). */
-const MAX_FETCHES = 4;
 /** A developer's signed request counts only this close to the API's clock, and only once. */
 const REQUEST_WINDOW = 5 * MINUTE;
 const SESSION = /^Bearer (myr_s_[A-Za-z0-9_-]{43})$/;
@@ -143,6 +140,23 @@ export class AccountStore {
 		return Number(this.db.prepare("UPDATE library_invites SET revoked = 1 WHERE id = ? AND listing_id = ?").run(id, listingId).changes) === 1;
 	}
 
+	/** Revokes a code and every grant it made (a leaked code, cleaned up in one go); answers how many grants, or undefined. */
+	revokeInviteAndGrants(listingId: string, id: number): number | undefined {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			if (!this.revokeInvite(listingId, id)) {
+				this.db.exec("ROLLBACK");
+				return undefined;
+			}
+			const n = Number(this.db.prepare("UPDATE library_grants SET revoked = 1 WHERE listing_id = ? AND invite_id = ? AND revoked = 0").run(listingId, id).changes);
+			this.db.exec("COMMIT");
+			return n;
+		} catch (e) {
+			this.db.exec("ROLLBACK");
+			throw e;
+		}
+	}
+
 	/**
 	 * Redeems a code for `uuid`: a grant on its listing, one use taken (none when the account already holds a grant).
 	 * Returns the listing, or undefined when the code doesn't work. One transaction, so a code's last use goes once.
@@ -223,16 +237,17 @@ export interface AccountDeps {
 	app: Hono;
 	db: DatabaseSync;
 	lib: LibraryStore;
-	github: GitHub | undefined;
 	mojang: Mojang;
 	now: () => number;
 	who: (c: Context) => string;
+	/** Rebuilds the index (after a listing's shown details change). */
+	changed: () => void;
 	/** This API's own origin: developer requests signed for any other are refused. */
 	apiOrigin: string;
 }
 
 /** The accounts' routes, on the Library's app; returns the hourly housekeeping. */
-export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigin }: AccountDeps): { sweep: () => void } {
+export function accountRoutes({ app, db, lib, mojang, now, who, changed, apiOrigin }: AccountDeps): { sweep: () => void } {
 	const store = new AccountStore(db);
 	const linking = new RateLimit(10, MINUTE);
 	const reads = new RateLimit(120, MINUTE);
@@ -240,6 +255,8 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 	const redeemsBySession = new RateLimit(10, HOUR);
 	const redeemsByAddress = new RateLimit(30, HOUR);
 	const downloads = new RateLimit(30, HOUR);
+	/** Every request with a session, per address, before the session is even looked up: a flood of made-up tokens stops here. */
+	const sessionTries = new RateLimit(120, MINUTE);
 	const small = bodyLimit({ maxSize: 16 * 1024, onError: c => c.json({ error: "Too big" }, 413) });
 
 	const tooMany = (c: Context) => {
@@ -272,8 +289,6 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 		const l = lib.listing(id);
 		return l && l.access === "invite" ? l : undefined;
 	};
-	/** Players fetching a private download now, and how many fetches run over everyone. */
-	const fetching = new Set<string>();
 
 	// ---- linking a Minecraft account -------------------------------------------------------------------------------
 
@@ -349,6 +364,7 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 			...(q.codeSha256 !== undefined ? { codeSha256: String(q.codeSha256) } : {}), ...(q.uses !== undefined ? { uses: Number(q.uses) } : {}),
 			...(q.notAfter !== undefined ? { notAfter: Number(q.notAfter) } : {}), ...(q.label !== undefined ? { label: String(q.label) } : {}),
 			...(q.invite !== undefined ? { invite: Number(q.invite) } : {}), ...(q.uuid !== undefined ? { uuid: String(q.uuid) } : {}),
+			...(q.show !== undefined ? { show: Array.isArray(q.show) ? q.show.slice(0, 8).map(String) as Showable[] : [] } : {}),
 		};
 		let bytes: Buffer;
 		try {
@@ -379,6 +395,14 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 				return c.json(store.invites(listing.id).map(i => ({ ...i, expires: new Date(i.expires).toISOString(), created: new Date(i.created).toISOString() })));
 			case "revoke":
 				return store.revokeInvite(listing.id, req.invite!) ? c.json({ ok: true }) : c.json({ error: "No such invite" }, 404);
+			case "revoke-all": {
+				const n = store.revokeInviteAndGrants(listing.id, req.invite!);
+				return n === undefined ? c.json({ error: "No such invite" }, 404) : c.json({ ok: true, grantsRevoked: n });
+			}
+			case "show":
+				lib.setShows(listing.id, req.show ?? []);
+				changed();
+				return c.json({ ok: true, show: req.show ?? [] });
 			case "grants":
 				return c.json(store.grants(listing.id).map(g => ({ ...g, created: new Date(g.created).toISOString() })));
 			case "revoke-grant":
@@ -391,6 +415,7 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 	// ---- players: redeeming, grants, downloads ---------------------------------------------------------------------
 
 	app.post("/v1/library/redeem", small, async c => {
+		if (!sessionTries.tryHit(who(c), now())) return tooMany(c);
 		const s = sessionOf(c);
 		if (!s) return c.json({ error: "Sign in with Minecraft first" }, 401);
 		if (!redeemsBySession.tryHit(String(s.id), now()) || !redeemsByAddress.tryHit(who(c), now())) return tooMany(c);
@@ -410,7 +435,20 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 		return c.json(store.grantsOf(s.uuid).filter(id => inviteListing(id)));
 	});
 
+	/** An invite-only listing's details as its players see them (with the changelog, whatever everyone else is shown). */
+	app.get("/v1/library/private/:id/details.json", c => {
+		if (!sessionTries.tryHit(who(c), now())) return tooMany(c);
+		const s = sessionOf(c);
+		if (!s) return c.json({ error: "Not signed in" }, 401);
+		const listing = inviteListing(c.req.param("id"));
+		if (!listing || !store.hasGrant(listing.id, s.uuid)) return c.json({ error: "No access to that addon" }, 403);
+		const text = detailsText(lib, listing, true);
+		if (!text) return c.json({ error: "No details" }, 404);
+		return c.body(text, 200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "private, no-store" });
+	});
+
 	app.get("/v1/library/private/:id/:version", async c => {
+		if (!sessionTries.tryHit(who(c), now())) return tooMany(c);
 		const s = sessionOf(c);
 		if (!s) return c.json({ error: "Not signed in" }, 401);
 		// Per player, not per session: signing in again doesn't buy more.
@@ -419,35 +457,20 @@ export function accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigi
 		if (!listing || !store.hasGrant(listing.id, s.uuid)) return c.json({ error: "No access to that addon" }, 403);
 		const v = lib.version(listing.id, c.req.param("version"));
 		const yanked = v && lib.yanks(listing.id).some(y => y.version === v.version && y.sha256 === v.sha256);
-		if (!v || yanked || !v.assetId) return c.json({ error: "No such release" }, 404);
-		const repo = lib.repo(listing.downloadRepoId);
-		if (!repo || repo.removed || !github) return c.json({ error: "Its releases can't be reached" }, 503);
-		// One fetch at a time per player, a few over everyone, and counted before it starts, so parallel requests can't
-		// slip past the daily cap while GitHub answers.
-		if (fetching.has(s.uuid) || fetching.size >= MAX_FETCHES) return tooMany(c);
+		if (!v || yanked) return c.json({ error: "No such release" }, 404);
 		if (store.downloadsSince(listing.id, s.uuid, v.version, now() - DAY) >= 10) return tooMany(c);
-		const counted = store.noteDownload(listing.id, s.uuid, v.version, now());
-		fetching.add(s.uuid);
-		let jar: Buffer;
-		try {
-			jar = await github.assetBytes(repo.installationId, repo.id, repo.fullName, v.assetId, Math.min(MAX_JAR, v.size));
-		} catch {
-			store.unnoteDownload(counted);
-			return c.json({ error: "Its release couldn't be fetched; try again later" }, 502);
-		} finally {
-			fetching.delete(s.uuid);
-		}
+		// The maintainer uploads it with the signed version; until then there's nothing to hand out.
+		const jar = lib.jar(listing.id, v.version);
+		if (!jar) return c.json({ error: "That release isn't ready yet; try again later" }, 503);
 		// Exactly the jar the listing key signed, or nothing (the game checks it again).
-		if (jar.length !== v.size || sha256(jar) !== v.sha256) {
-			store.unnoteDownload(counted);
-			return c.json({ error: "Its release isn't the jar the Library lists" }, 502);
-		}
-		return c.body(new Uint8Array(jar), 200, { "Content-Type": "application/java-archive", "Cache-Control": "no-store", "Content-Length": String(jar.length) });
+		if (jar.data.length !== v.size || jar.sha256 !== v.sha256 || sha256(jar.data) !== v.sha256) return c.json({ error: "Its release isn't the jar the Library lists" }, 502);
+		store.noteDownload(listing.id, s.uuid, v.version, now());
+		return c.body(new Uint8Array(jar.data), 200, { "Content-Type": "application/java-archive", "Cache-Control": "no-store", "Content-Length": String(jar.data.length) });
 	});
 
 	return {
 		sweep: () => {
-			for (const r of [linking, reads, writes, redeemsBySession, redeemsByAddress, downloads]) r.sweep(now());
+			for (const r of [linking, reads, writes, redeemsBySession, redeemsByAddress, downloads, sessionTries]) r.sweep(now());
 			store.forgetOld(now());
 		},
 	};

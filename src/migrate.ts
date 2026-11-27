@@ -178,6 +178,20 @@ const STEPS: string[] = [
 		at         INTEGER NOT NULL
 	);
 	CREATE INDEX library_downloads_who ON library_downloads (listing_id, uuid, at)`,
+	// 6: what an invite-only listing shows everyone beyond its modules (its developer's choice): changelog, repo.
+	`ALTER TABLE library_listings ADD COLUMN shows TEXT NOT NULL DEFAULT '[]'`,
+	// 7: the API keeps no key to developers' repositories. Check runs wait here for the private builder to post them;
+	// invite-only jars are uploaded by the maintainer with the signed version and served from here.
+	`ALTER TABLE library_submissions ADD COLUMN check_pending TEXT;
+	ALTER TABLE library_submissions ADD COLUMN check_seq INTEGER NOT NULL DEFAULT 0;
+	CREATE TABLE library_jars (
+		listing_id TEXT NOT NULL,
+		version    TEXT NOT NULL,
+		sha256     TEXT NOT NULL,
+		data       BLOB NOT NULL,
+		added      INTEGER NOT NULL,
+		PRIMARY KEY (listing_id, version)
+	)`,
 ];
 
 export const SCHEMA_VERSION = STEPS.length;

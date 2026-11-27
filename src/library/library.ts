@@ -5,13 +5,13 @@ import { clientKey } from "../address.ts";
 import { keyMatches } from "../codes.ts";
 import { RateLimit } from "../rateLimit.ts";
 import type { LibraryConfig } from "./config.ts";
-import { type CheckRun, type GitHub, webhookSignatureValid } from "./github.ts";
+import { type CheckRun, checkBody, type GitHub, webhookSignatureValid } from "./github.ts";
 import {
-	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, detailsText, downloadable, listingLive, Refused, shown, versionInfo,
+	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, detailsText, downloadable, listingLive, Refused, shown, showsAll, versionInfo,
 } from "./rules.ts";
 import { accountRoutes, type Mojang, realMojang } from "./accounts.ts";
 import { approvedCheck, buildingCheck, listedCheck, queuedCheck, refusedCheck, reviewCheck } from "./checks.ts";
-import { InvalidStatement, MAX_JAR, privateKey } from "./statements.ts";
+import { InvalidStatement, MAX_JAR, privateKey, sha256Hex } from "./statements.ts";
 import { type Builder, LibraryStore, type ListingRow, type SubmissionRow } from "./store.ts";
 
 const MINUTE = 60_000;
@@ -45,9 +45,11 @@ export interface Library {
  *
  * Public: `GET /v1/index.json` (signed index, with ETag), `GET /v1/library/addons[/:id[/icon.png]]`.
  * GitHub: `POST /v1/github/webhook`.
- * Builders (their own token): `GET /v1/library/builds/:id`, `POST .../started`, `.../result`, `.../source-token`.
+ * Builders (their own token): `GET /v1/library/builds/:id`, `POST .../started`, `.../result`; the private builder also
+ * `GET /v1/library/checks` and `POST /v1/library/checks/:id` (it posts every check run: the API holds no repo key).
  * Maintainer (admin token): `GET /v1/library/pending`, `POST /v1/library/submissions/:id/accept|reject`,
- * `POST /v1/library/approvals` (signed listings, versions, yanks, certificates), `POST /v1/library/listings/:id/pause`.
+ * `POST /v1/library/approvals` (signed listings, versions, yanks, certificates), `POST /v1/library/listings/:id/pause`,
+ * `PUT /v1/library/jars/:id/:version` (an invite-only release's jar, kept only if a signed version names it).
  */
 export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: GitHub | undefined, trustedProxies: number, now: () => number = Date.now,
 	mojang: Mojang = realMojang): Library {
@@ -82,7 +84,11 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		rebuild();
 		deploySoon();
 	};
-	const check = (submission: number, run: CheckRun) => lib.addJob("check-run", { submission, run }, now());
+	/** A submission's check run changes: kept here and posted by the private builder (one workflow run for all waiting). */
+	const check = (submission: number, run: CheckRun) => {
+		lib.setPendingCheck(submission, run, now());
+		if (!lib.hasPendingJob("checks")) lib.addJob("checks", {}, now());
+	};
 
 	// ---- public ---------------------------------------------------------------------------------------------------
 
@@ -293,18 +299,35 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		return c.json({ ok: true });
 	});
 
-	/** A one-time, 15-minute token to read the closed-source repository of this build, and only that one. */
-	app.post("/v1/library/builds/:id/source-token", async c => {
-		const b = buildFor(c);
-		if (b instanceof Response) return b;
-		if (b.builder !== "closed" || !github) return c.json({ error: "Not allowed" }, 403);
-		if (now() - (b.sub.dispatchedAt ?? 0) > 15 * MINUTE) return c.json({ error: "Too late for a token" }, 410);
-		const listing = lib.listingForRepo(b.sub.repoId);
-		const source = lib.repo(listing?.source === "closed" ? listing.repoId : b.sub.repoId);
-		if (!source || source.removed) return c.json({ error: "No source repository" }, 404);
-		if (!lib.claimSourceToken(b.sub.id, now())) return c.json({ error: "Already given" }, 409);
-		const token = await github.installationToken(source.installationId, { repositoryIds: [source.id], permissions: { contents: "read" } });
-		return c.json({ token, repo: source.fullName });
+	// ---- check runs, posted by the private builder (which holds the Library App's key) ---------------------------------
+
+	const closedBuilder = (c: Context): Response | undefined => {
+		if (!writes.tryHit(who(c), now())) return tooMany(c);
+		return builderOf(c) === "closed" ? undefined : c.json({ error: "Not allowed" }, 403);
+	};
+
+	/** What check runs to post: for each, the repository and tag, the run already made (if any) and what it should say. */
+	app.get("/v1/library/checks", c => {
+		const no = closedBuilder(c);
+		if (no) return no;
+		return c.json(lib.pendingChecks(50).flatMap(p => {
+			const repo = lib.repo(p.submission.repoId);
+			if (!repo || repo.removed) return [];
+			return [{
+				submission: p.submission.id, seq: p.seq, repo: { id: repo.id, fullName: repo.fullName, ownerId: repo.ownerId }, tag: p.submission.tag,
+				headSha: p.submission.headSha, checkRunId: p.submission.checkRunId, run: checkBody(p.run as CheckRun),
+			}];
+		}));
+	});
+
+	/** The builder posted a check run: its id and commit, so later changes update the same run. */
+	app.post("/v1/library/checks/:id", async c => {
+		const no = closedBuilder(c);
+		if (no) return no;
+		const body = await jsonBody(c);
+		const seq = Number(body?.seq), runId = Number(body?.checkRunId), head = String(body?.headSha ?? "");
+		if (!Number.isSafeInteger(seq) || !Number.isSafeInteger(runId) || runId <= 0 || !/^[0-9a-f]{40}$/.test(head)) return c.json({ error: "Not a posted check run" }, 400);
+		return lib.checkPosted(Number(c.req.param("id")), seq, runId, head, now()) ? c.json({ ok: true }) : c.json({ error: "No such check run" }, 404);
 	});
 
 	app.post("/v1/library/builds/:id/result", bodyLimit({ maxSize: 1024 * 1024, onError: c => c.json({ error: "Too big" }, 413) }), async c => {
@@ -374,19 +397,20 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		})));
 	});
 
-	/** A submission's released jar from a private repository, for the maintainer's review tool (admin only). */
-	app.get("/v1/library/submissions/:id/jar", async c => {
+	/**
+	 * An invite-only release's jar, from the maintainer's review tool (which took it from the builder's run and signed
+	 * the version): kept only when it's exactly the jar a signed version names. Players download it from here.
+	 */
+	app.put("/v1/library/jars/:id/:version", bodyLimit({ maxSize: MAX_JAR, onError: c => c.json({ error: "Too big" }, 413) }), async c => {
 		const no = adminOnly(c);
 		if (no) return no;
-		const sub = lib.submission(Number(c.req.param("id")));
-		const repo = sub && lib.repo(sub.repoId);
-		if (!sub || !repo || !sub.assetId || !github) return c.json({ error: "No jar for that submission" }, 404);
-		try {
-			const jar = await github.assetBytes(repo.installationId, repo.id, repo.fullName, sub.assetId, MAX_JAR);
-			return c.body(new Uint8Array(jar), 200, { "Content-Type": "application/java-archive", "Cache-Control": "no-store" });
-		} catch {
-			return c.json({ error: "Its release couldn't be fetched" }, 502);
-		}
+		const l = lib.listing(c.req.param("id"));
+		const v = l && lib.version(l.id, c.req.param("version"));
+		if (!l || l.access !== "invite" || !v) return c.json({ error: "No signed invite-only version with that id" }, 404);
+		const jar = Buffer.from(await c.req.arrayBuffer());
+		if (jar.length !== v.size || sha256Hex(jar) !== v.sha256) return c.json({ error: "That isn't the jar the signed version names" }, 422);
+		lib.putJar(l.id, v.version, v.sha256, jar, now());
+		return c.json({ ok: true });
 	});
 
 	app.post("/v1/library/submissions/:id/accept", c => {
@@ -493,6 +517,10 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 			return;
 		}
 		if (!github) throw new Error("GitHub isn't set up");
+		if (kind === "checks") {
+			if (lib.pendingChecks(1).length > 0) await github.dispatch(config.builderClosedRepo, "checks.yml", {});
+			return;
+		}
 		const sub = lib.submission(Number(payload?.submission));
 		if (!sub) return;
 		if (kind === "dispatch") {
@@ -500,19 +528,11 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 			const since = now() - 6 * HOUR;
 			const repo = lib.repo(sub.repoId);
 			if (lib.activeBuilds(since) >= MAX_BUILDS || (repo && lib.activeBuilds(since, repo.installationId) >= MAX_BUILDS_EACH)) throw new Busy();
-			await github.dispatch(sub.builder === "open" ? config.builderOpenRepo : config.builderClosedRepo, sub.id);
+			await github.dispatch(sub.builder === "open" ? config.builderOpenRepo : config.builderClosedRepo, "build.yml", { submission: String(sub.id) });
 			lib.updateSubmission(sub.id, { dispatchedAt: now() }, now());
 		} else if (kind === "check-run") {
-			const repo = lib.repo(sub.repoId);
-			if (!repo || repo.removed) return;
-			let head = sub.headSha;
-			if (!head) {
-				head = await github.commitOf(repo.installationId, repo.fullName, sub.tag);
-				lib.updateSubmission(sub.id, { headSha: head }, now());
-			}
-			const fresh = lib.submission(sub.id)!;
-			if (fresh.checkRunId) await github.updateCheckRun(repo.installationId, repo.fullName, fresh.checkRunId, payload.run);
-			else lib.updateSubmission(sub.id, { checkRunId: await github.createCheckRun(repo.installationId, repo.fullName, head, payload.run) }, now());
+			// Queued before the private builder posted check runs: handed over the new way.
+			check(sub.id, payload.run as CheckRun);
 		}
 	}
 
@@ -538,7 +558,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 	}
 
 	// Players' accounts and invite-only addons (accounts.ts).
-	const accounts = accountRoutes({ app, db, lib, github, mojang, now, who, apiOrigin: config.apiOrigin ?? "https://api.myriadclient.dev" });
+	const accounts = accountRoutes({ app, db, lib, mojang, now, who, changed, apiOrigin: config.apiOrigin ?? "https://api.myriadclient.dev" });
 
 	function start(): void {
 		setInterval(() => void tick(), 30_000).unref();
@@ -561,11 +581,11 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 function summary(lib: LibraryStore, l: ListingRow) {
 	const latest = lib.versions(l.id, 1)[0];
 	return {
-		id: l.id, name: l.name, description: l.description, author: l.author, repo: l.repoName || null,
+		id: l.id, name: l.name, description: l.description, author: l.author, repo: showsAll(l, "repo") ? l.repoName || null : null,
 		badge: l.source === "open" ? "verified" : "reviewed", icon: lib.icon(l.id) ? `/v1/library/addons/${l.id}/icon.png` : null, access: l.access,
 		latest: latest ? { version: latest.version, minecraft: latest.minecraft, added: new Date(latest.createdAt).toISOString() } : null,
 		modules: latest?.modules ?? [],
-		changelog: latest?.changelog ? { version: latest.version, text: latest.changelog } : null,
+		changelog: latest?.changelog && showsAll(l, "changelog") ? { version: latest.version, text: latest.changelog } : null,
 		updated: new Date(l.updatedAt).toISOString(),
 	};
 }

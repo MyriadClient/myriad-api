@@ -29,34 +29,14 @@ const base: Config = {
 };
 
 class FakeGitHub implements GitHub {
+	/** Builds started, by builder repository and submission. */
 	dispatched: { repo: string; submission: number }[] = [];
-	checks: { repo: string; run: CheckRun }[] = [];
-	tokens: { installation: number; scope?: unknown }[] = [];
-	async installationToken(installation: number, scope?: unknown) {
-		this.tokens.push({ installation, scope });
-		return "ghs_scoped";
-	}
-	async commitOf() {
-		return "e".repeat(40);
-	}
-	async createCheckRun(_i: number, repo: string, _h: string, run: CheckRun) {
-		this.checks.push({ repo, run });
-		return 77;
-	}
-	async updateCheckRun(_i: number, repo: string, _id: number, run: CheckRun) {
-		this.checks.push({ repo, run });
-	}
-	async dispatch(repo: string, submission: number) {
-		this.dispatched.push({ repo, submission });
-	}
-	asset: Buffer = Buffer.alloc(0);
-	assets: { installation: number; repoId: number; repo: string; assetId: number }[] = [];
-	/** When set, downloads wait for it (to have several in flight at once). */
-	assetGate?: Promise<void>;
-	async assetBytes(installation: number, repoId: number, repo: string, assetId: number) {
-		this.assets.push({ installation, repoId, repo, assetId });
-		if (this.assetGate) await this.assetGate;
-		return this.asset;
+	/** Runs of the private builder's checks workflow started. */
+	checkRuns = 0;
+	async dispatch(repo: string, workflow: string, inputs: Record<string, string>) {
+		if (workflow === "build.yml") this.dispatched.push({ repo, submission: Number(inputs.submission) });
+		else if (workflow === "checks.yml" && repo === "MyriadClient/myriad-builder-private") this.checkRuns++;
+		else throw new Error(`unexpected dispatch ${repo} ${workflow}`);
 	}
 }
 
@@ -84,7 +64,7 @@ function setup(over: Partial<LibraryConfig> = {}) {
 	};
 	const mojang = new FakeMojang();
 	const library = createLibrary(store.db, config, github, 1, now, mojang);
-	const app = createApp(store, base, now, library);
+	const app = behindProxy(createApp(store, base, now, library));
 	return { app, library, github, store, mojang, advance: (ms: number) => { clock += ms; }, now };
 }
 
@@ -133,6 +113,17 @@ function hook(app: App, event: string, payload: unknown, guid = crypto.randomUUI
 		body,
 	});
 }
+
+/** The check runs waiting for the private builder to post. */
+async function pendingChecks(app: App) {
+	const res = await req(app, "GET", "/v1/library/checks", undefined, CLOSED);
+	assert.equal(res.status, 200);
+	return await res.json() as { submission: number; seq: number; repo: { id: number; fullName: string }; tag: string; checkRunId: number | null; run: { status: string; output: { title: string } } }[];
+}
+
+/** The maintainer's review tool uploading an invite-only release's jar. */
+const putJar = (app: App, id: string, version: string, jar: Buffer, token = ADMIN) =>
+	app.request(`/v1/library/jars/${id}/${version}`, { method: "PUT", headers: { authorization: `Bearer ${token}`, "content-type": "application/octet-stream", "x-forwarded-for": "10.9.0.1" }, body: jar });
 
 const installation = (repos: { id: number; full_name: string; private?: boolean }[], owner = 200) => ({
 	action: "created", installation: { id: 5, account: { id: owner, login: "dev" } }, repositories: repos,
@@ -263,7 +254,10 @@ test("a release becomes a build; the open builder signs it in; the developer see
 	assert.equal((await hook(app, "release", released(100, "dev/good-addon", "v1.1.0"))).status, 202);
 	await library.tick();
 	assert.deepEqual(github.dispatched, [{ repo: "MyriadClient/myriad-builder", submission: 1 }], "one build for one release");
-	assert.match(github.checks[0]?.run.title ?? "", /^Queued/);
+	assert.equal(github.checkRuns, 1, "the private builder is asked to post the check run");
+	const [queued] = await pendingChecks(app);
+	assert.match(queued!.run.output.title, /^Queued/);
+	assert.deepEqual([queued!.repo.fullName, queued!.tag, queued!.checkRunId], ["dev/good-addon", "v1.1.0", null]);
 
 	assert.equal((await req(app, "GET", "/v1/library/builds/1")).status, 403);
 	assert.equal((await req(app, "GET", "/v1/library/builds/1", undefined, CLOSED)).status, 404, "the closed builder can't see an open build");
@@ -271,7 +265,7 @@ test("a release becomes a build; the open builder signs it in; the developer see
 	assert.equal(spec.tag, "v1.1.0");
 	assert.equal(spec.listing.id, "good-addon");
 	assert.equal((await req(app, "POST", "/v1/library/builds/1/started", undefined, OPEN)).status, 200);
-	assert.equal((await req(app, "POST", "/v1/library/builds/1/source-token", undefined, OPEN)).status, 403, "open builds get no tokens");
+	assert.equal((await req(app, "POST", "/v1/library/builds/1/source-token", undefined, OPEN)).status, 404, "the API hands out no tokens any more");
 
 	const forged = await req(app, "POST", "/v1/library/builds/1/result", { outcome: "signed", version: versionDoc("1.1.0", undefined, OTHER) }, OPEN);
 	assert.equal(forged.status, 422);
@@ -356,8 +350,8 @@ test("a repository that changes owner is paused, even when GitHub never said it 
 	assert.equal(library.store.submission(1), undefined, "nothing is built for it");
 });
 
-test("the closed builder only reviews, and gets one short-lived token for one repository", async () => {
-	const { app, library, github, advance } = setup();
+test("the closed builder only reviews; the API hands out no repository tokens", async () => {
+	const { app, library, github } = setup();
 	await ready(app);
 	await hook(app, "installation", installation([{ id: 101, full_name: "dev/secret", private: true }]));
 	await hook(app, "release", released(101, "dev/secret", "v1.0.0", true));
@@ -368,20 +362,47 @@ test("the closed builder only reviews, and gets one short-lived token for one re
 	assert.equal((await req(app, "POST", "/v1/library/submissions/1/accept", undefined, ADMIN)).status, 200);
 	await library.tick();
 	assert.deepEqual(github.dispatched, [{ repo: "MyriadClient/myriad-builder-private", submission: 1 }]);
-
-	const tok = await req(app, "POST", "/v1/library/builds/1/source-token", undefined, CLOSED);
-	assert.equal(tok.status, 200);
-	assert.deepEqual(github.tokens.at(-1), { installation: 5, scope: { repositoryIds: [101], permissions: { contents: "read" } } });
-	assert.equal((await req(app, "POST", "/v1/library/builds/1/source-token", undefined, CLOSED)).status, 409, "only once");
+	assert.equal((await req(app, "POST", "/v1/library/builds/1/source-token", undefined, CLOSED)).status, 404, "no token route");
 	assert.equal((await req(app, "POST", "/v1/library/builds/1/result", { outcome: "signed", version: versionDoc("1.0.0") }, CLOSED)).status, 403, "the closed builder never signs");
 	assert.equal((await req(app, "POST", "/v1/library/builds/1/result", { outcome: "review", reason: "new addon" }, CLOSED)).status, 200);
 	assert.equal(library.store.submission(1)?.status, "review");
+});
 
-	await hook(app, "release", released(101, "dev/secret", "v1.0.1", true));
-	await req(app, "POST", "/v1/library/submissions/2/accept", undefined, ADMIN);
+test("check runs wait for the private builder, which posts them and reports back; newer changes win", async () => {
+	const { app, library } = setup();
+	await ready(app);
+	await hook(app, "installation", installation([{ id: 101, full_name: "dev/secret", private: true }]));
+	await hook(app, "release", released(101, "dev/secret", "v1.0.0", true));
+	assert.equal((await req(app, "GET", "/v1/library/checks", undefined, OPEN)).status, 403, "only the private builder");
+	assert.equal((await req(app, "GET", "/v1/library/checks")).status, 403);
+	const [first] = await pendingChecks(app);
+	assert.equal(first!.submission, 1);
+	// The maintainer accepts while the builder is posting the first: the newer change stays pending.
+	await req(app, "POST", "/v1/library/submissions/1/accept", undefined, ADMIN);
+	const head = "a".repeat(40);
+	assert.equal((await req(app, "POST", "/v1/library/checks/1", { seq: first!.seq, checkRunId: 77, headSha: head }, OPEN)).status, 403);
+	assert.equal((await req(app, "POST", "/v1/library/checks/1", { seq: first!.seq, checkRunId: 77, headSha: "nope" }, CLOSED)).status, 400);
+	assert.equal((await req(app, "POST", "/v1/library/checks/1", { seq: first!.seq, checkRunId: 77, headSha: head }, CLOSED)).status, 200);
+	const [next] = await pendingChecks(app);
+	assert.equal(next!.checkRunId, 77, "the next change updates the same run");
+	assert.ok(next!.seq > first!.seq);
+	assert.equal((await req(app, "POST", "/v1/library/checks/1", { seq: next!.seq, checkRunId: 78, headSha: head }, CLOSED)).status, 404, "a run can't be swapped for another");
+	assert.equal((await req(app, "POST", "/v1/library/checks/1", { seq: next!.seq, checkRunId: 77, headSha: head }, CLOSED)).status, 200);
+	assert.deepEqual(await pendingChecks(app), []);
+	assert.equal(library.store.submission(1)?.headSha, head);
+});
+
+test("check runs queued the old way are handed to the private builder", async () => {
+	const { app, library, github } = setup();
+	await ready(app);
+	await hook(app, "installation", installation([{ id: 101, full_name: "dev/secret", private: true }]));
+	await hook(app, "release", released(101, "dev/secret", "v1.0.0", true));
+	library.store.db.prepare("UPDATE library_submissions SET check_pending = NULL").run();
+	library.store.addJob("check-run", { submission: 1, run: { status: "queued", title: "Old", summary: "old" } }, 0);
 	await library.tick();
-	advance(16 * 60_000);
-	assert.equal((await req(app, "POST", "/v1/library/builds/2/source-token", undefined, CLOSED)).status, 410, "too late");
+	await library.tick();
+	assert.equal((await pendingChecks(app))[0]?.run.output.title, "Old");
+	assert.ok(github.checkRuns >= 1);
 });
 
 test("a transferred repository pauses its listing and drops it from the index", async () => {
@@ -479,6 +500,7 @@ async function inviteOnly(app: App, library: ReturnType<typeof setup>["library"]
 	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...l, doc: { ...l.doc, access: "invite" } }, ADMIN)).status, 200);
 	assert.equal((await req(app, "POST", "/v1/library/approvals", { kind: "version", doc: versionDoc("1.0.0", sha256Hex(jar), LISTING, DEV, "closed-addon") }, ADMIN)).status, 200);
 	library.store.setVersionAsset("closed-addon", "1.0.0", 555);
+	assert.equal((await putJar(app, "closed-addon", "1.0.0", jar)).status, 200);
 }
 
 let nonces = 0;
@@ -575,7 +597,6 @@ test("developers manage invites with signed requests; codes are only ever hashes
 test("redeeming grants access once per code use, and only the right account downloads the exact jar", async () => {
 	const { app, library, mojang, github, now } = setup();
 	const jar = Buffer.alloc(1000, 7);
-	github.asset = jar;
 	await inviteOnly(app, library, jar);
 	const token = await signIn(app, mojang);
 	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 403, "no grant yet");
@@ -596,12 +617,9 @@ test("redeeming grants access once per code use, and only the right account down
 	assert.equal(got.status, 200);
 	assert.equal(got.headers.get("cache-control"), "no-store");
 	assert.deepEqual(Buffer.from(await got.arrayBuffer()), jar);
-	assert.deepEqual(github.assets.at(-1), { installation: 5, repoId: 103, repo: "dev/secret-releases", assetId: 555 });
 	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, alex)).status, 403, "another account");
 
-	github.asset = Buffer.alloc(1000, 8);
-	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 502, "not the listed jar");
-	github.asset = jar;
+	assert.equal((await putJar(app, "closed-addon", "1.0.0", Buffer.alloc(1000, 8))).status, 422, "only the listed jar is kept");
 
 	const revoke = invite({ action: "revoke-grant", uuid: PLAYER.id }, now());
 	assert.equal((await req(app, "POST", "/v1/library/invites", revoke)).status, 200);
@@ -639,34 +657,33 @@ test("an expired or revoked invite doesn't work", async () => {
 	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: b }, token)).status, 404, "revoked");
 });
 
-test("parallel downloads can't slip past the daily cap, and signing in again buys no more", async () => {
-	const { app, library, mojang, github, now } = setup();
+test("downloads are capped per player per version per day, however many at once, and signing in again buys no more", async () => {
+	const { app, library, mojang, now } = setup();
 	const jar = Buffer.alloc(1000, 7);
-	github.asset = jar;
 	await inviteOnly(app, library, jar);
 	const token = await signIn(app, mojang);
 	const code = `myr-${"F".repeat(27)}`;
 	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(code)!), uses: 1, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
 	assert.equal((await req(app, "POST", "/v1/library/redeem", { code }, token)).status, 200);
-
-	// Fifteen at once while GitHub is slow: one is fetched, the rest are turned away.
-	let open!: () => void;
-	github.assetGate = new Promise(r => open = r);
-	const burst = Array.from({ length: 15 }, () => req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token));
-	await new Promise(r => setTimeout(r, 20));
-	open();
-	const codes = (await Promise.all(burst)).map(r => r.status);
-	assert.equal(codes.filter(c => c === 200).length, 1, codes.join(","));
-	github.assetGate = undefined;
-
-	// One at a time, ten a day per version, whichever session asks.
-	for (let i = 1; i < 10; i++) assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 200);
-	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 429);
+	const burst = await Promise.all(Array.from({ length: 15 }, () => req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)));
+	const codes = burst.map(r => r.status);
+	assert.equal(codes.filter(c => c === 200).length, 10, codes.join(","));
+	assert.equal(codes.filter(c => c === 429).length, 5);
 	const again = await signIn(app, mojang);
 	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, again)).status, 429, "a new session is the same player");
+	assert.equal((library.store.db.prepare("SELECT COUNT(*) AS n FROM library_downloads").get() as { n: number }).n, 10, "only what reached the player");
+});
 
-	// Only what reached the player is counted: the turned-away requests in the burst aren't.
-	assert.equal((library.store.db.prepare("SELECT COUNT(*) AS n FROM library_downloads").get() as { n: number }).n, 10);
+test("a private release isn't handed out until the maintainer uploads its jar", async () => {
+	const { app, library, mojang, now } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	library.store.db.prepare("DELETE FROM library_jars").run();
+	const token = await signIn(app, mojang);
+	const code = `myr-${"M".repeat(27)}`;
+	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(code)!), uses: 1, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
+	await req(app, "POST", "/v1/library/redeem", { code }, token);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 503);
+	assert.equal((library.store.db.prepare("SELECT COUNT(*) AS n FROM library_downloads").get() as { n: number }).n, 0, "not counted");
 });
 
 test("a private releases repository made public pauses its listing", async () => {
@@ -689,6 +706,114 @@ test("developers can still revoke while their listing is paused", async () => {
 	assert.equal(library.store.db.prepare("SELECT revoked FROM library_grants").get()!.revoked, 1);
 });
 
+test("an invite-only listing shows its modules but keeps its changelog and repository for its players, unless its developer opts in", async () => {
+	const { app, library, mojang, now } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	library.store.setVersionInfo("closed-addon", "1.0.0", [{ name: "Secret Module", description: "Does things", tag: "misc" }], "- the secret change");
+	await req(app, "POST", "/v1/library/listings/closed-addon/pause", undefined, ADMIN);
+	const l = listingDoc({ id: "closed-addon", repoId: 101, source: "closed", downloadRepoId: 103, revision: 2 });
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...l, doc: { ...l.doc, info: { repo: "dev/closed-addon" } } }, ADMIN)).status, 200);
+
+	const everyone = async () => {
+		const entry = (await index(app)).body.addons.find((a: { listing: { id: string } }) => a.listing.id === "closed-addon");
+		const summary = await (await req(app, "GET", "/v1/library/addons/closed-addon")).json() as { repo: string | null; changelog: unknown; modules: unknown[] };
+		const details = await (await req(app, "GET", "/v1/library/addons/closed-addon/details.json")).json() as { changelog: string | null; modules: unknown[] };
+		return { entry, summary, details };
+	};
+	let seen = await everyone();
+	assert.equal(seen.entry.info.repo, undefined, "no repository in the index");
+	assert.equal(seen.summary.repo, null);
+	assert.equal(seen.summary.changelog, null);
+	assert.equal(seen.details.changelog, null, "no changelog for everyone");
+	assert.equal(seen.details.modules.length, 1, "the modules always show");
+	assert.equal(seen.summary.modules.length, 1);
+	assert.ok(!JSON.stringify(seen).includes("secret change") && !JSON.stringify(seen).includes("dev/closed-addon"));
+
+	// Its players see the changelog; nobody else gets the private details.
+	const token = await signIn(app, mojang);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/details.json", undefined, token)).status, 403, "no grant");
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/details.json")).status, 401, "no session");
+	const code = `myr-${"H".repeat(27)}`;
+	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(code)!), uses: 1, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code }, token)).status, 200);
+	const mine = await req(app, "GET", "/v1/library/private/closed-addon/details.json", undefined, token);
+	assert.equal(mine.status, 200);
+	assert.equal(mine.headers.get("cache-control"), "private, no-store");
+	assert.equal((await mine.json() as { changelog: string }).changelog, "- the secret change");
+
+	// Opting in takes the developer's signature, and only known things in a fixed order.
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "show", show: ["changelog", "repo"] }, now(), OTHER))).status, 403);
+	for (const bad of [["repo", "changelog"], ["source"], ["repo", "repo"]]) {
+		const signed = invite({ action: "show", show: ["changelog", "repo"] }, now());
+		assert.equal((await req(app, "POST", "/v1/library/invites", { ...signed, request: { ...signed.request, show: bad } })).status, 400, bad.join());
+	}
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "show", show: ["changelog", "repo"] }, now()))).status, 200);
+	seen = await everyone();
+	assert.equal(seen.entry.info.repo, "dev/closed-addon");
+	assert.equal(seen.details.changelog, "- the secret change");
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "show", show: [] }, now()))).status, 200);
+	assert.equal((await everyone()).details.changelog, null, "and back off");
+});
+
+test("revoking a leaked code can take every grant it made, and only those", async () => {
+	const { app, library, mojang, github, now } = setup();
+	const jar = Buffer.alloc(1000, 7);
+	await inviteOnly(app, library, jar);
+	const leaked = `myr-${"J".repeat(27)}`, kept = `myr-${"K".repeat(27)}`;
+	for (const c of [leaked, kept]) await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(c)!), uses: 10, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
+	const steve = await signIn(app, mojang);
+	const alex = await signIn(app, mojang, { id: "fedcba9876543210fedcba9876543210", name: "Alex" });
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: leaked }, steve)).status, 200);
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: kept }, alex)).status, 200);
+	const list = await (await req(app, "POST", "/v1/library/invites", invite({ action: "list" }, now()))).json() as { id: number }[];
+	const res = await req(app, "POST", "/v1/library/invites", invite({ action: "revoke-all", invite: list[0]!.id }, now()));
+	assert.deepEqual(await res.json(), { ok: true, grantsRevoked: 1 });
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, steve)).status, 403, "the leaked code's player is out");
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, alex)).status, 200, "another code's player isn't");
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: leaked }, alex)).status, 404, "the code is dead");
+	assert.equal((await req(app, "POST", "/v1/library/invites", invite({ action: "revoke-all", invite: 9999 }, now()))).status, 404);
+});
+
+test("an invite-only listing needs its releases repository private, by state as well as by GitHub's events", async () => {
+	const { app, library, mojang, github, now } = setup();
+	await inviteOnly(app, library, Buffer.alloc(1000, 7));
+	const token = await signIn(app, mojang);
+	const code = `myr-${"L".repeat(27)}`;
+	await req(app, "POST", "/v1/library/invites", invite({ action: "create", codeSha256: sha256Hex(canonicalCode(code)!), uses: 1, notAfter: Math.floor(now() / 1000) + 3600 }, now()));
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code }, token)).status, 200);
+	// GitHub's "publicized" event was missed, but a later event carried the repository's state.
+	library.store.putRepo({ id: 103, installationId: 5, ownerId: 200, fullName: "dev/secret-releases", private: false }, 1);
+	assert.equal((await req(app, "GET", "/v1/library/addons/closed-addon")).status, 404);
+	assert.equal((await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, token)).status, 403, "nothing served as invite-only");
+	// And approving it as invite-only is refused while its releases are public.
+	const l = listingDoc({ id: "closed-addon", repoId: 101, source: "closed", downloadRepoId: 103, revision: 2 });
+	assert.equal((await req(app, "POST", "/v1/library/approvals", { ...l, doc: { ...l.doc, access: "invite" } }, ADMIN)).status, 422);
+});
+
+test("only the maintainer uploads a private jar, and only the one a signed invite-only version names", async () => {
+	const { app, library } = setup();
+	const jar = Buffer.alloc(1000, 7);
+	await inviteOnly(app, library, jar);
+	assert.equal((await putJar(app, "closed-addon", "1.0.0", jar, CLOSED)).status, 403, "not the builder");
+	assert.equal((await putJar(app, "closed-addon", "1.0.0", jar, "x".repeat(32))).status, 403);
+	assert.equal((await putJar(app, "closed-addon", "9.9.9", jar)).status, 404, "an unsigned version");
+	assert.equal((await putJar(app, "closed-addon", "1.0.0", Buffer.alloc(999, 7))).status, 422, "another size");
+	assert.equal((await putJar(app, "closed-addon", "1.0.0", Buffer.alloc(1000, 9))).status, 422, "another jar");
+	await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN);
+	assert.equal((await putJar(app, "good-addon", "1.0.0", jar)).status, 404, "public listings' jars stay on GitHub");
+	assert.equal((await putJar(app, "closed-addon", "1.0.0", jar)).status, 200, "the same jar again is fine");
+	assert.deepEqual(library.store.jar("closed-addon", "1.0.0")?.data, jar);
+});
+
+test("made-up session tokens from one address are cut off before they're looked up", async () => {
+	const { app } = setup();
+	const from = { "x-forwarded-for": "7.7.7.7" };
+	let last = 0;
+	for (let i = 0; i < 125; i++) last = (await req(app, "GET", "/v1/library/private/closed-addon/1.0.0", undefined, `myr_s_${"a".repeat(43)}`, from)).status;
+	assert.equal(last, 429);
+	assert.equal((await req(app, "POST", "/v1/library/redeem", { code: "x" }, `myr_s_${"a".repeat(43)}`, from)).status, 429, "redeem shares the limit");
+});
+
 test("a session ends 90 days after it was made, however much it's used", async () => {
 	const { app, mojang, advance } = setup();
 	const token = await signIn(app, mojang);
@@ -699,3 +824,10 @@ test("a session ends 90 days after it was made, however much it's used", async (
 	advance(3 * 24 * 3600_000);
 	assert.equal((await req(app, "GET", "/v1/auth/session", undefined, token)).status, 401);
 });
+
+/** Requests as the front proxy (on our own network) hands them on; tests without it reached the API directly. */
+function behindProxy<T extends { request: (...a: any[]) => any }>(app: T): T {
+	const request = app.request.bind(app);
+	app.request = ((input: any, init?: any, env?: any, ctx?: any) => request(input, init, env ?? { incoming: { socket: { remoteAddress: "172.18.0.2" } } }, ctx)) as T["request"];
+	return app;
+}

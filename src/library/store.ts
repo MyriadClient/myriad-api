@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { KeyCert, Listing, Role, Sig, Source } from "./statements.ts";
+import { SHOWABLE, type KeyCert, type Listing, type Role, type Showable, type Sig, type Source } from "./statements.ts";
 
 /** A listing as stored: the signed fields, their signatures, and what's shown about it (unsigned). */
 export interface ListingRow extends Listing {
@@ -16,6 +16,11 @@ export interface ListingRow extends Listing {
 	updatedAt: number;
 	/** "invite": its jars come from a private releases repository and go only to accounts with a grant. */
 	access: "public" | "invite";
+	/**
+	 * What an invite-only listing shows everyone beyond its name, description, icon and modules: its developer's choice
+	 * (a public listing shows everything). Players with a grant see it all.
+	 */
+	shows: Showable[];
 }
 
 export interface VersionRow {
@@ -176,7 +181,7 @@ export class LibraryStore {
 
 	// ---- listings ---------------------------------------------------------------------------------------------------
 
-	putListing(l: Omit<ListingRow, "paused" | "updatedAt">, now: number): void {
+	putListing(l: Omit<ListingRow, "paused" | "updatedAt" | "shows">, now: number): void {
 		this.db.prepare(`INSERT INTO library_listings (id, revision, repo_id, owner_id, source, download_repo_id, build, provides, keys, sigs, name, description, author, repo_name, accepted, accepted_sigs, paused, updated_at, access)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, repo_id = excluded.repo_id, owner_id = excluded.owner_id, source = excluded.source,
@@ -232,6 +237,11 @@ export class LibraryStore {
 	setVersionAsset(listingId: string, version: string, assetId: number | null): void {
 		if (assetId === null) return;
 		this.db.prepare("UPDATE library_versions SET asset_id = ? WHERE listing_id = ? AND version = ?").run(assetId, listingId, version);
+	}
+
+	/** What an invite-only listing shows everyone (its developer's signed choice). */
+	setShows(listingId: string, shows: Showable[]): void {
+		this.db.prepare("UPDATE library_listings SET shows = ? WHERE id = ?").run(json(shows), listingId);
 	}
 
 	/** Makes a listing invite-only, or public again. */
@@ -298,6 +308,35 @@ export class LibraryStore {
 	}
 
 	/** Marks the source token as issued, only once: false when it was issued before. */
+	/** Sets the check run a submission should show, for the private builder to post (newest wins: `check_seq` counts). */
+	setPendingCheck(id: number, run: unknown, now: number): void {
+		this.db.prepare("UPDATE library_submissions SET check_pending = ?, check_seq = check_seq + 1, updated_at = ? WHERE id = ?").run(JSON.stringify(run), now, id);
+	}
+
+	/** Check runs waiting to be posted, oldest change first. */
+	pendingChecks(limit: number): { submission: SubmissionRow; seq: number; run: unknown }[] {
+		return (this.db.prepare("SELECT * FROM library_submissions WHERE check_pending IS NOT NULL ORDER BY updated_at, id LIMIT ?").all(limit) as Row[])
+			.map(r => ({ submission: submissionOf(r), seq: Number(r.check_seq), run: parse(r.check_pending) }));
+	}
+
+	/** Records a posted check run; the pending one is cleared only if nothing newer arrived meanwhile. */
+	checkPosted(id: number, seq: number, checkRunId: number, headSha: string, now: number): boolean {
+		const r = this.db.prepare(`UPDATE library_submissions SET check_run_id = ?, head_sha = ?, check_pending = CASE WHEN check_seq = ? THEN NULL ELSE check_pending END,
+			updated_at = ? WHERE id = ? AND (check_run_id IS NULL OR check_run_id = ?)`).run(checkRunId, headSha, seq, now, id, checkRunId);
+		return Number(r.changes) === 1;
+	}
+
+	/** Keeps an invite-only release's jar (the caller has checked it against the signed version). */
+	putJar(listingId: string, version: string, sha256: string, data: Buffer, now: number): void {
+		this.db.prepare(`INSERT INTO library_jars (listing_id, version, sha256, data, added) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(listing_id, version) DO UPDATE SET sha256 = excluded.sha256, data = excluded.data, added = excluded.added`).run(listingId, version, sha256, data, now);
+	}
+
+	jar(listingId: string, version: string): { sha256: string; data: Buffer } | undefined {
+		const r = this.db.prepare("SELECT sha256, data FROM library_jars WHERE listing_id = ? AND version = ?").get(listingId, version) as { sha256: string; data: Uint8Array } | undefined;
+		return r && { sha256: String(r.sha256), data: Buffer.from(r.data) };
+	}
+
 	claimSourceToken(id: number, now: number): boolean {
 		return Number(this.db.prepare("UPDATE library_submissions SET token_issued = 1, updated_at = ? WHERE id = ? AND token_issued = 0").run(now, id).changes) === 1;
 	}
@@ -360,6 +399,7 @@ function listingOf(r: Row): ListingRow {
 		sigs: parse<Sig[]>(r.sigs), name: String(r.name), description: String(r.description), author: String(r.author), repoName: String(r.repo_name),
 		accepted: parse<string[]>(r.accepted), acceptedSigs: parse<Sig[]>(r.accepted_sigs), paused: Number(r.paused) === 1, updatedAt: Number(r.updated_at),
 		access: r.access === "invite" ? "invite" : "public",
+		shows: r.shows === undefined || r.shows === null ? [] : parse<unknown[]>(r.shows).filter((x): x is Showable => (SHOWABLE as readonly unknown[]).includes(x)),
 	};
 }
 
