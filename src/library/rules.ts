@@ -1,4 +1,4 @@
-import type { LibraryStore, ListingRow } from "./store.ts";
+import type { LibraryStore, ListingRow, ModuleInfo } from "./store.ts";
 import {
 	acceptedBytes, ID, InvalidStatement, isKey, keyCertBytes, listingBytes, releaseBytes, revocationsBytes, sha256Hex, signer, signWith, snapshotBytes, versionBytes, yankBytes,
 	type KeyCert, type Listing, type privateKey, type Role, type Sig,
@@ -73,6 +73,43 @@ export function shown(v: unknown, max: number): string {
 		return !(c < 0x20 || (c >= 0x7f && c < 0xa0) || c === 0xa7 || (c >= 0xe000 && c <= 0xf8ff) || c >= 0xf0000 || (c >= 0x200b && c <= 0x200f) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2060 && c <= 0x206f) || c === 0x2028 || c === 0x2029 || c === 0xfeff);
 	});
 	return cleaned.slice(0, max).join("").trim();
+}
+
+/** {@link shown} line by line: line breaks kept (at most `maxLines`), blank runs squeezed to one, `max` characters in all. */
+export function shownLines(v: unknown, max: number, maxLines: number): string {
+	if (typeof v !== "string") return "";
+	const out: string[] = [];
+	let blank = false;
+	for (const line of v.split(/\r\n|\r|\n/)) {
+		const c = shown(line, max);
+		if (!c) {
+			if (!blank && out.length) out.push("");
+			blank = true;
+			continue;
+		}
+		blank = false;
+		out.push(c);
+		if (out.length >= maxLines) break;
+	}
+	while (out.length && out[out.length - 1] === "") out.pop();
+	return [...out.join("\n")].slice(0, max).join("").trim();
+}
+
+export const MAX_MODULES = 300, MAX_CHANGELOG = 4000, MAX_CHANGELOG_LINES = 80;
+
+/** What Browse shows of a version, from a builder's report: its modules and changelog, cleaned; anything odd is dropped. */
+export function versionInfo(report: unknown): { modules: ModuleInfo[]; changelog: string | null } {
+	const r = report && typeof report === "object" ? report as Record<string, unknown> : {};
+	const modules: ModuleInfo[] = [];
+	for (const m of Array.isArray(r.modules) ? r.modules : []) {
+		if (modules.length >= MAX_MODULES) break;
+		if (!m || typeof m !== "object") continue;
+		const o = m as Record<string, unknown>;
+		const name = shown(o.name, 64);
+		if (name) modules.push({ name, description: shown(o.description, 200), tag: shown(o.tag, 32) });
+	}
+	const changelog = shownLines(r.changelog, MAX_CHANGELOG, MAX_CHANGELOG_LINES) || null;
+	return { modules, changelog };
 }
 
 export function acceptCert(store: LibraryStore, roots: string[], body: unknown, now: number): KeyCert {
@@ -208,7 +245,7 @@ export function buildSnapshot(store: LibraryStore, indexKey: ReturnType<typeof p
 				id: l.id, revision: l.revision, repoId: l.repoId, ownerId: l.ownerId, source: l.source,
 				...(l.source === "closed" ? { downloadRepoId: l.downloadRepoId } : {}), build: l.build, provides: l.provides, keys: l.keys, signatures: l.sigs,
 			},
-			info: { name: l.name, description: l.description, author: l.author, repo: l.repoName },
+			info: info(store, l),
 			versions: store.versions(l.id).map(v => ({
 				version: v.version, size: v.size, sha256: v.sha256, commit: v.commit, url: v.url, ...(v.minecraft ? { minecraft: v.minecraft } : {}),
 				signatures: v.sigs, developer: v.developer,
@@ -217,12 +254,39 @@ export function buildSnapshot(store: LibraryStore, indexKey: ReturnType<typeof p
 		})),
 	};
 	const bodyText = JSON.stringify(body);
+	if (bodyText.length > INDEX_WARN_BYTES) console.warn(`Library index is ${bodyText.length} bytes: near the 4 MB clients accept`);
 	const snapshot = { issued, expires: body.expires, bodySha256: sha256Hex(Buffer.from(bodyText, "utf8")) };
 	const text = JSON.stringify({ format: 1, body: bodyText, signatures: [signWith(indexKey, snapshotBytes(snapshot))] });
 	const etag = `"${sha256Hex(text).slice(0, 32)}"`;
 	store.putSnapshot(issued, text, etag);
 	return { issued, text, etag };
 }
+
+/**
+ * What Browse shows of a listing's newest version beyond its index entry: its modules and changelog, as one document
+ * served at /v1/library/addons/:id/details.json. Kept out of the signed index (which every client reads whole, under a
+ * size cap) and tied to it by its hash, like the icon. The same text every time for the same data.
+ */
+export function detailsText(store: LibraryStore, l: ListingRow): string | undefined {
+	const latest = store.versions(l.id, 1)[0];
+	if (!latest || (!latest.modules?.length && !latest.changelog)) return undefined;
+	return JSON.stringify({ id: l.id, version: latest.version, modules: latest.modules ?? [], changelog: latest.changelog ?? null });
+}
+
+/** The display half of a listing's index entry: who and what it is, and the hashes of its icon and its details. */
+function info(store: LibraryStore, l: ListingRow) {
+	const icon = store.icon(l.id);
+	const details = detailsText(store, l);
+	const modules = store.versions(l.id, 1)[0]?.modules?.length ?? 0;
+	return {
+		name: l.name, description: l.description, author: l.author, repo: l.repoName,
+		...(icon ? { icon: sha256Hex(icon) } : {}),
+		...(details ? { details: sha256Hex(Buffer.from(details, "utf8")), moduleCount: modules } : {}),
+	};
+}
+
+/** Past this the index nears what clients accept (4 MB): said loudly, so it's dealt with before it's refused. */
+const INDEX_WARN_BYTES = 3 * 1024 * 1024;
 
 export function checkId(id: unknown, ownerIsMyriad: boolean): string {
 	if (typeof id !== "string" || !ID.test(id)) throw new Refused("not a mod id");

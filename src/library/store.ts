@@ -27,6 +27,15 @@ export interface VersionRow {
 	sigs: Sig[];
 	developer: Sig[];
 	createdAt: number;
+	/** Display only, from the builder's report: what the version adds, and what changed in it. */
+	modules?: ModuleInfo[];
+	changelog?: string | null;
+}
+
+export interface ModuleInfo {
+	name: string;
+	description: string;
+	tag: string;
 }
 
 export interface YankRow {
@@ -214,6 +223,11 @@ export class LibraryStore {
 		return Number(r.changes) === 1;
 	}
 
+	/** Sets what Browse shows of a version (its modules and changelog), already cleaned. */
+	setVersionInfo(listingId: string, version: string, modules: ModuleInfo[], changelog: string | null): void {
+		this.db.prepare("UPDATE library_versions SET modules = ?, changelog = ? WHERE listing_id = ? AND version = ?").run(json(modules), changelog, listingId, version);
+	}
+
 	version(listingId: string, version: string): VersionRow | undefined {
 		const r = this.db.prepare("SELECT * FROM library_versions WHERE listing_id = ? AND version = ?").get(listingId, version) as Row | undefined;
 		return r && versionOf(r);
@@ -336,7 +350,8 @@ function versionOf(r: Row): VersionRow {
 	return {
 		listingId: String(r.listing_id), version: String(r.version), size: Number(r.size), sha256: String(r.sha256), commit: String(r.commit_sha),
 		url: String(r.url), minecraft: r.minecraft === null ? null : String(r.minecraft), sigs: parse<Sig[]>(r.sigs), developer: parse<Sig[]>(r.developer),
-		createdAt: Number(r.created_at),
+		createdAt: Number(r.created_at), modules: r.modules === undefined || r.modules === null ? [] : parse<ModuleInfo[]>(r.modules),
+		changelog: r.changelog === undefined || r.changelog === null ? null : String(r.changelog),
 	};
 }
 

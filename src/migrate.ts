@@ -124,6 +124,9 @@ const STEPS: string[] = [
 	)`,
 	// 3: the listing key's signature over each listing's accepted findings (the builder trusts only signed ones).
 	`ALTER TABLE library_listings ADD COLUMN accepted_sigs TEXT NOT NULL DEFAULT '[]'`,
+	// 4: what Browse shows of each version before it's installed: its modules and its changelog, from the builder's report.
+	`ALTER TABLE library_versions ADD COLUMN modules TEXT NOT NULL DEFAULT '[]';
+	ALTER TABLE library_versions ADD COLUMN changelog TEXT`,
 ];
 
 export const SCHEMA_VERSION = STEPS.length;

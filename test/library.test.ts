@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { test } from "node:test";
@@ -270,6 +271,37 @@ test("a signed result lists the version and rebuilds the index", async () => {
 	assert.equal((await index(app)).body.addons[0].versions[0].version, "1.1.0");
 	assert.equal((await req(app, "GET", "/v1/library/addons/good-addon/icon.png")).headers.get("content-type"), "image/png");
 	assert.equal((await req(app, "POST", "/v1/library/builds/1/result", { outcome: "failed" }, OPEN)).status, 404, "a finished build takes no more results");
+});
+
+test("a version's modules, changelog and icon reach the index as display info, cleaned", async () => {
+	const { app, library } = setup();
+	await ready(app);
+	await req(app, "POST", "/v1/library/approvals", listingDoc(), ADMIN);
+	await hook(app, "installation", installation([{ id: 100, full_name: "dev/good-addon" }]));
+	await hook(app, "release", released(100, "dev/good-addon", "v1.1.0"));
+	await library.tick();
+	const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(20)]);
+	const asset = "https://github.com/dev/good-addon/releases/download/v1.1.0/x-1.0.0.jar";
+	const report = {
+		modules: [{ name: "Kill Aura\uf00c", description: "Attacks targets.", tag: "Combat" }, "junk", { description: "nameless" }],
+		changelog: "- Faster\r\n\n\n\n- Fixed\u0000 it",
+	};
+	const res = await req(app, "POST", "/v1/library/builds/1/result", { outcome: "signed", version: { ...versionDoc("1.1.0"), url: asset }, icon: png.toString("base64"), report }, OPEN);
+	assert.equal(res.status, 200);
+	const info = (await index(app)).body.addons[0].info;
+	assert.equal(info.modules, undefined, "the details stay out of the signed index");
+	assert.equal(info.moduleCount, 1);
+	assert.equal(info.icon, createHash("sha256").update(png).digest("hex"));
+	const details = await req(app, "GET", "/v1/library/addons/good-addon/details.json");
+	const text = await details.text();
+	assert.equal(info.details, createHash("sha256").update(text).digest("hex"), "the index names the details by their hash");
+	const d = JSON.parse(text);
+	assert.deepEqual(d.modules, [{ name: "Kill Aura", description: "Attacks targets.", tag: "Combat" }]);
+	assert.equal(d.changelog, "- Faster\n\n- Fixed it");
+	assert.equal(d.version, "1.1.0");
+	const site = await (await req(app, "GET", "/v1/library/addons/good-addon")).json();
+	assert.equal(site.modules.length, 1);
+	assert.equal(site.changelog.version, "1.1.0");
 });
 
 test("a builder's result counts only for its own release", async () => {

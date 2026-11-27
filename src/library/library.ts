@@ -7,7 +7,7 @@ import { RateLimit } from "../rateLimit.ts";
 import type { LibraryConfig } from "./config.ts";
 import { type CheckRun, type GitHub, webhookSignatureValid } from "./github.ts";
 import {
-	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, downloadable, listingLive, Refused, shown,
+	acceptCert, acceptListing, acceptRevocations, acceptVersion, acceptYank, buildSnapshot, checkId, detailsText, downloadable, listingLive, Refused, shown, versionInfo,
 } from "./rules.ts";
 import { InvalidStatement, privateKey } from "./statements.ts";
 import { type Builder, LibraryStore, type ListingRow, type SubmissionRow } from "./store.ts";
@@ -116,6 +116,14 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 				added: new Date(v.createdAt).toISOString(), yanked: yanked.has(`${v.version}/${v.sha256}`),
 			})),
 		});
+	});
+
+	app.get("/v1/library/addons/:id/details.json", c => {
+		if (!reads.tryHit(who(c), now())) return tooMany(c);
+		const l = lib.listing(c.req.param("id"));
+		const text = l && listingLive(lib, l) ? detailsText(lib, l) : undefined;
+		if (!text) return c.json({ error: "No details" }, 404);
+		return c.body(text, 200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" });
 	});
 
 	app.get("/v1/library/addons/:id/icon.png", c => {
@@ -293,7 +301,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		return c.json({ token, repo: source.fullName });
 	});
 
-	app.post("/v1/library/builds/:id/result", bodyLimit({ maxSize: 256 * 1024, onError: c => c.json({ error: "Too big" }, 413) }), async c => {
+	app.post("/v1/library/builds/:id/result", bodyLimit({ maxSize: 1024 * 1024, onError: c => c.json({ error: "Too big" }, 413) }), async c => {
 		const b = buildFor(c);
 		if (b instanceof Response) return b;
 		const body = await jsonBody(c);
@@ -301,7 +309,7 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 		const t = now();
 		const report = body.report && typeof body.report === "object" ? body.report : {};
 		const icon = iconOf(body.icon);
-		if (JSON.stringify(report).length > 128 * 1024) return c.json({ error: "Report too big" }, 413);
+		if (JSON.stringify(report).length > 768 * 1024) return c.json({ error: "Report too big" }, 413);
 		const stored = { ...report, ...(icon ? { icon: icon.toString("base64") } : {}) };
 		if (body.outcome === "signed") {
 			if (b.builder !== "open") return c.json({ error: "Not allowed" }, 403);
@@ -309,7 +317,12 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 				const own = lib.listingForRepo(b.sub.repoId);
 				if (!own || body.version?.id !== own.id) throw new Refused("the version isn't this repository's listing");
 				if (body.version?.url !== b.sub.assetUrl) throw new Refused("the version isn't this release's jar");
-				const added = lib.transaction(() => acceptVersion(lib, config.rootKeys, body.version, t));
+				const added = lib.transaction(() => {
+					const r = acceptVersion(lib, config.rootKeys, body.version, t);
+					const shownInfo = versionInfo(report);
+					lib.setVersionInfo(own.id, String(body.version.version), shownInfo.modules, shownInfo.changelog);
+					return r;
+				});
 				if (icon && added.added) lib.putIcon(own.id, icon);
 				lib.updateSubmission(b.sub.id, { status: "signed", reason: null, report: stored }, t);
 				check(b.sub.id, { status: "completed", conclusion: "success", title: "Listed", summary: `Version ${shown(body.version?.version, 64)} is in the Myriad Library.` });
@@ -403,7 +416,17 @@ export function createLibrary(db: DatabaseSync, config: LibraryConfig, github: G
 						if (icon) lib.putIcon(l.id, icon);
 						break;
 					}
-					case "version": acceptVersion(lib, config.rootKeys, body.doc, t); break;
+					case "version": {
+						acceptVersion(lib, config.rootKeys, body.doc, t);
+						// A reviewed version shows what its build's report said, and refreshes the listing's icon.
+						if (sub?.report) {
+							const shownInfo = versionInfo(sub.report);
+							lib.setVersionInfo(String(body.doc.id), String(body.doc.version), shownInfo.modules, shownInfo.changelog);
+							const icon = typeof (sub.report as any)?.icon === "string" ? iconOf((sub.report as any).icon) : undefined;
+							if (icon) lib.putIcon(String(body.doc.id), icon);
+						}
+						break;
+					}
 					case "yank": acceptYank(lib, config.rootKeys, body.doc, t); break;
 					default: throw new Refused("not a kind of approval");
 				}
@@ -512,6 +535,8 @@ function summary(lib: LibraryStore, l: ListingRow) {
 		id: l.id, name: l.name, description: l.description, author: l.author, repo: l.repoName || null,
 		badge: l.source === "open" ? "verified" : "reviewed", icon: lib.icon(l.id) ? `/v1/library/addons/${l.id}/icon.png` : null,
 		latest: latest ? { version: latest.version, minecraft: latest.minecraft, added: new Date(latest.createdAt).toISOString() } : null,
+		modules: latest?.modules ?? [],
+		changelog: latest?.changelog ? { version: latest.version, text: latest.changelog } : null,
 		updated: new Date(l.updatedAt).toISOString(),
 	};
 }
